@@ -1,0 +1,46 @@
+# Sonic Vector Configuration File
+# Copy this to config.yaml and fill in your actual credentials
+
+# Spotify API Credentials
+# Create an app at https://developer.spotify.com/dashboard
+spotify:
+  client_id: "your_spotify_client_id_here"
+  client_secret: "your_spotify_client_secret_here"
+  redirect_uri: "http://127.0.0.1:8888/callback"
+
+# Google Gemini API
+# Get your API key from https://aistudio.google.com/apikey
+gemini:
+  api_key: "your_gemini_api_key_here"
+  model: "gemini-2.5-flash-lite"
+  translator_model: "gemini-2.5-flash-lite"  # Fast model for extracting search tags
+  synthesizer_model: "gemini-2.5-flash"      # More capable model for final response
+
+# LLM Provider Configuration
+# Set provider to "gemini" or "local" (for LM Studio, Ollama, Llamafile)
+llm:
+  provider: "gemini"
+  local_api_url: "http://127.0.0.1:8080/v1"
+  local_model: "meta-llama-3.1-8b-instruct-q4_k_m.gguf"
+
+# Equalizer APO Path
+# Path to the Equalizer APO config.txt file. Windows default is shown below.
+equalizer_apo:
+  config_path: "C:\\Program Files\\EqualizerAPO\\config\\config.txt"
+
+# Application Settings
+app:
+  polling_interval: 1.5  # seconds between Spotify checks
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  database_path: "data/songs.db"
+
+# Conversation Context & Intelligence Router Settings
+conversation:
+  enable_smart_context: true  # Use AI to decide when history context is needed
+  context_router_model: "gemini-2.5-flash-lite"
+  high_relevance_threshold: 0.7
+  moderate_relevance_threshold: 0.3
+  history_length: 3
+  tag_memory_length: 5
+  enable_user_profile: false
+  tag_consistency_weight: 0.7

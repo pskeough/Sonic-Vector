@@ -1,0 +1,26 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+ENV/
+
+# Configuration and Credentials
+config.yaml
+
+# Spotify Token Caching and playback state caches
+data/spotify_tokens.json
+.spotify_cache
+
+# Local user-specific songs database (caching manual adjustments)
+data/songs.db
+
+# Logs and system backups
+logs/
+*.log
+data/config.txt

@@ -1,4 +1,28 @@
 flask>=3.0.0
 pyyaml>=6.0
 requests>=2.31.0
+
+# Windows now-playing (System Media Transport Controls). This is what lets the
+# app detect what is playing with no account and no network, from any player on
+# the machine. `winsdk` is the package most examples reach for and it is dead:
+# last release 2023, wheels stop at cp311. These are the maintained projection.
+#
+# winrt-Windows.Media is NOT pulled in transitively by Media.Control, and
+# without it playback_type raises AttributeError while every other field works,
+# which fails late and reads like a data problem rather than a missing package.
+winrt-runtime>=3.2.1; sys_platform == "win32"
+winrt-Windows.Media.Control>=3.2.1; sys_platform == "win32"
+winrt-Windows.Media>=3.2.1; sys_platform == "win32"
+winrt-Windows.Foundation>=3.2.1; sys_platform == "win32"
+winrt-Windows.Foundation.Collections>=3.2.1; sys_platform == "win32"
+winrt-Windows.Storage.Streams>=3.2.1; sys_platform == "win32"
+
+# Desktop shortcuts, and the console-close handler that resets the EQ to flat.
+pywin32>=306; sys_platform == "win32"
+
+# App icon generation (tools/make_icon.py).
+pillow>=10.0.0
+
+# Optional: only needed for the AI mixing engine, which is off by default and
+# is never on the path that produces a curve.
 google-genai>=0.1.0

@@ -1,0 +1,439 @@
+/* ════════════════════════════════════════════════════════════════════════
+   harness.css — chrome around the 3D stage.
+
+   Tokens are copied verbatim from SonicVectorEQ/static/style.css so the
+   prototype cannot drift from the console it has to sit next to. If a colour
+   here is not in that file, it is a bug.
+
+   Everything except the canvas is prototype scaffolding. The parts that would
+   actually ship are .np (now-playing silkscreen) and .lamp (state LED).
+   ════════════════════════════════════════════════════════════════════════ */
+
+:root {
+    --desk-1: #26231e;
+    --desk-2: #17150f;
+    --wood-1: #7a5233;
+    --wood-2: #55351d;
+    --wood-3: #35200f;
+
+    --fascia: #ece8db;
+    --fascia-hi: #f6f3ea;
+    --panel: #f1eee4;
+    --panel-edge: #c8c2ae;
+    --panel-shade: #ddd8c6;
+
+    --ink: #262520;
+    --ink-soft: #55534a;
+    --etch: #6f6c5e;
+    --etch-faint: #918d7c;
+
+    --clay: #d97757;
+    --clay-deep: #b85c3f;
+    --amber: #e9a13b;
+    --amber-led: #f3b152;
+    --sage: #7c8a62;
+    --sage-led: #a4c076;
+    --red-led: #e06a50;
+
+    --well: #1c1914;
+    --well-2: #14120d;
+    --well-edge: #38342a;
+
+    --serif: 'Lora', Georgia, 'Times New Roman', serif;
+    --grot: 'Space Grotesk', 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+    --mono: 'IBM Plex Mono', 'Cascadia Mono', Consolas, ui-monospace, monospace;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+    height: 100%;
+    overflow: hidden;
+    background: var(--desk-2);
+    font-family: var(--grot);
+    color: var(--fascia);
+    -webkit-font-smoothing: antialiased;
+    user-select: none;
+}
+
+#stage {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    /* The renderer clears to its own colour; this only covers the gap before
+       the first frame lands. */
+    background: var(--desk-2);
+}
+
+/* ── Now-playing silkscreen ──────────────────────────────────────────── */
+
+.np {
+    position: fixed;
+    left: 46px;
+    top: 40px;
+    max-width: 34ch;
+    pointer-events: none;
+    z-index: 4;
+    /* Transitions are driven from JS on track change so the type can cross-fade
+       in step with the record swap rather than on its own clock. */
+    transition: opacity 260ms ease;
+}
+
+.np-src {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.22em;
+    color: var(--amber);
+    opacity: 0.72;
+    margin-bottom: 12px;
+}
+
+.np-title {
+    font-family: var(--serif);
+    font-size: 34px;
+    line-height: 1.12;
+    color: var(--fascia-hi);
+    text-wrap: balance;
+}
+
+.np-artist {
+    font-family: var(--grot);
+    font-size: 15px;
+    letter-spacing: 0.02em;
+    color: var(--clay);
+    margin-top: 8px;
+}
+
+.np-meta {
+    display: flex;
+    gap: 14px;
+    align-items: baseline;
+    margin-top: 14px;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    color: var(--etch-faint);
+}
+
+.np-time { color: var(--amber); opacity: 0.85; }
+
+/* ── State lamp ──────────────────────────────────────────────────────── */
+
+.lamp {
+    position: fixed;
+    right: 46px;
+    top: 44px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    z-index: 4;
+    pointer-events: none;
+}
+
+.lamp-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--well-edge);
+    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.6);
+    transition: background 200ms ease, box-shadow 200ms ease;
+}
+
+.lamp[data-state="playing"] .lamp-dot {
+    background: var(--sage-led);
+    box-shadow: 0 0 10px rgba(164, 192, 118, 0.75), inset 0 0 0 1px rgba(0, 0, 0, 0.35);
+}
+.lamp[data-state="cueing"] .lamp-dot {
+    background: var(--amber-led);
+    box-shadow: 0 0 10px rgba(243, 177, 82, 0.8), inset 0 0 0 1px rgba(0, 0, 0, 0.35);
+}
+.lamp[data-state="fault"] .lamp-dot {
+    background: var(--red-led);
+    box-shadow: 0 0 10px rgba(224, 106, 80, 0.8), inset 0 0 0 1px rgba(0, 0, 0, 0.35);
+}
+
+.lamp-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    color: var(--etch-faint);
+}
+
+/* ── Data source badge ───────────────────────────────────────────────── */
+
+.src {
+    position: fixed;
+    right: 46px;
+    top: 76px;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    z-index: 4;
+    pointer-events: none;
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.16em;
+}
+
+.src-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--well-edge);
+    transition: background 220ms ease, box-shadow 220ms ease;
+}
+
+.src[data-state="live"] .src-dot {
+    background: var(--sage-led);
+    box-shadow: 0 0 9px rgba(164, 192, 118, 0.7);
+}
+.src[data-state="demo"] .src-dot {
+    background: var(--clay);
+    box-shadow: 0 0 9px rgba(217, 119, 87, 0.55);
+}
+.src[data-state="waiting"] .src-dot {
+    background: var(--amber-led);
+    box-shadow: 0 0 9px rgba(243, 177, 82, 0.7);
+}
+
+.src-label { color: var(--etch-faint); }
+.src[data-state="live"] .src-label { color: var(--sage-led); }
+.src[data-state="demo"] .src-label { color: var(--clay); }
+.src[data-state="waiting"] .src-label { color: var(--amber); }
+
+.src-detail {
+    color: var(--etch-faint);
+    opacity: 0.62;
+    letter-spacing: 0.06em;
+    text-transform: none;
+    max-width: 34ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* ── Control bar (slim, always visible) ──────────────────────────────────
+   Kept to a single ~34 px strip hard against the bottom edge. The previous
+   version was a five-row console panel floating over the lower third of the
+   frame, which put chrome on top of the deck — the one thing the view exists
+   to show. Anything not reached for repeatedly now lives in the drawer.       */
+
+.bar {
+    position: fixed;
+    left: 50%;
+    bottom: 0;
+    transform: translateX(-50%);
+    z-index: 6;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 5px 10px;
+    border-radius: 9px 9px 0 0;
+    background: linear-gradient(180deg, rgba(38, 35, 30, 0.86), rgba(23, 21, 15, 0.94));
+    border: 1px solid rgba(122, 82, 51, 0.42);
+    border-bottom: none;
+    box-shadow: 0 -8px 26px rgba(0, 0, 0, 0.45);
+    /* backdrop-filter deliberately omitted: the console stylesheet forbids blur
+       filters, and this has to look like it came from the same product. */
+}
+
+.bar-group { display: flex; gap: 3px; }
+
+.bar-sep {
+    width: 1px;
+    height: 16px;
+    margin: 0 6px;
+    background: rgba(236, 232, 219, 0.14);
+}
+
+.tab {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.13em;
+    color: var(--etch-faint);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    padding: 6px 12px;
+    cursor: pointer;
+    transition: color 140ms ease, background 140ms ease, border-color 140ms ease;
+}
+.tab:hover { color: var(--fascia); background: rgba(236, 232, 219, 0.07); }
+
+.tab.on {
+    color: #2a1c06;
+    background: linear-gradient(180deg, var(--amber-led), var(--amber));
+    border-color: #b3781f;
+}
+
+.tab:disabled { opacity: 0.3; cursor: not-allowed; }
+.tab:disabled:hover { color: var(--etch-faint); background: transparent; }
+
+.tab-quiet { color: rgba(145, 141, 124, 0.7); }
+
+/* ── Drawer (prototype scaffolding) ─────────────────────────────────────── */
+
+.drawer {
+    position: fixed;
+    left: 50%;
+    bottom: 36px;
+    transform: translateX(-50%);
+    z-index: 6;
+    display: grid;
+    gap: 8px;
+    padding: 12px 16px;
+    border-radius: 9px;
+    background: linear-gradient(180deg, rgba(38, 35, 30, 0.94), rgba(23, 21, 15, 0.97));
+    border: 1px solid rgba(122, 82, 51, 0.42);
+    box-shadow: 0 14px 34px rgba(0, 0, 0, 0.5);
+}
+.drawer[hidden] { display: none; }
+
+.drawer-row { display: flex; align-items: center; gap: 8px; }
+
+.drawer-legend {
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.16em;
+    color: var(--etch-faint);
+    width: 74px;
+    flex: none;
+    text-align: right;
+}
+
+.drawer-note {
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.06em;
+    color: var(--etch-faint);
+    opacity: 0.55;
+}
+
+.slide {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 150px;
+    height: 3px;
+    border-radius: 2px;
+    background: rgba(236, 232, 219, 0.22);
+    cursor: pointer;
+}
+.slide::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 10px;
+    height: 16px;
+    border-radius: 3px;
+    background: linear-gradient(180deg, #fbf9f2, #cfc9b5);
+    border: 1px solid #9d9784;
+}
+.slide:disabled { opacity: 0.32; cursor: not-allowed; }
+
+.readout {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.05em;
+    color: var(--amber);
+    min-width: 46px;
+}
+
+.chk {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.12em;
+    color: var(--etch-faint);
+    cursor: pointer;
+}
+.chk input { accent-color: var(--clay); width: 12px; height: 12px; }
+
+/* ── Stats ───────────────────────────────────────────────────────────── */
+
+.stats {
+    position: fixed;
+    right: 46px;
+    bottom: 26px;
+    z-index: 5;
+    display: grid;
+    gap: 3px;
+    padding: 10px 13px;
+    border-radius: 7px;
+    background: rgba(20, 18, 13, 0.82);
+    border: 1px solid var(--well-edge);
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+}
+.stats div { display: flex; justify-content: space-between; gap: 18px; }
+.stats span { color: var(--etch-faint); }
+.stats b { color: var(--amber); font-weight: 500; }
+
+/* ── Boot veil ───────────────────────────────────────────────────────── */
+
+.boot {
+    position: fixed;
+    inset: 0;
+    z-index: 20;
+    display: grid;
+    place-items: center;
+    background: radial-gradient(900px 520px at 50% 42%, var(--desk-1), var(--desk-2) 76%);
+    transition: opacity 520ms ease;
+}
+.boot.gone { opacity: 0; pointer-events: none; }
+
+.boot-inner { display: grid; gap: 20px; justify-items: center; }
+
+.boot-mark {
+    width: 42px;
+    height: 42px;
+    border-radius: 50%;
+    border: 2px solid rgba(233, 161, 59, 0.22);
+    border-top-color: var(--amber);
+    animation: spin 900ms linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.boot-text {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    color: var(--etch-faint);
+    text-align: center;
+    max-width: 62ch;
+    line-height: 1.7;
+}
+
+/* Boot failure. Loud on purpose — the failure this replaces was a loading
+   message that simply never advanced, which is indistinguishable from a slow
+   machine and gives nothing to act on. */
+.boot.failed .boot-mark {
+    animation: none;
+    border-color: rgba(224, 106, 80, 0.3);
+    border-top-color: var(--red-led);
+}
+.boot.failed .boot-text b {
+    display: block;
+    color: var(--red-led);
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    margin-bottom: 12px;
+}
+.boot-detail {
+    color: var(--fascia);
+    letter-spacing: 0.02em;
+    word-break: break-word;
+}
+.boot-hint {
+    margin-top: 12px;
+    opacity: 0.6;
+    letter-spacing: 0.08em;
+}
+
+/* The whole point of this view is motion. If the OS says no, fall back to a
+   still frame rather than shipping a lie about respecting the setting. */
+@media (prefers-reduced-motion: reduce) {
+    .boot-mark { animation: none; }
+}

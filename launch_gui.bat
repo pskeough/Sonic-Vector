@@ -1,75 +1,115 @@
 @echo off
-title Sonic Vector — Dashboard Launcher
-color 0B
+setlocal enabledelayedexpansion
+title Sonic Vector
+
+:: Move to the script's own directory FIRST. Everything below touches files
+:: relative to it, and the working directory is not the script directory when
+:: the launcher is started from a shortcut, from "Run as administrator", or
+:: from another folder.
+cd /d "%~dp0"
 
 echo ============================================================================
-echo                      Sonic Vector Dashboard Launcher
-echo ============================================================================
-echo.
-echo Sonic Vector requires Spotify Developer Credentials to track active playback.
-echo.
-echo SETUP INSTRUCTIONS:
-echo 1. Go to: https://developer.spotify.com/dashboard and log in.
-echo 2. Click "Create app", name it "Sonic Vector", and select "Web API".
-echo 3. Add this EXACT Redirect URI in the app settings:
-echo    http://127.0.0.1:8888/callback
-echo 4. Save the app, copy your "Client ID" and "Client Secret".
-echo 5. Open "config.yaml" in this directory and paste them in the spotify section.
-echo.
+echo                                Sonic Vector
 echo ============================================================================
 echo.
 
-:: Check if config.yaml exists
-if not exist "config.yaml" (
-    echo [ERROR] config.yaml not found. Creating it from example...
-    copy config.example.yaml config.yaml > nul
-    echo [ACTION] Please edit config.yaml and insert your Spotify credentials before proceeding.
+:: ---------------------------------------------------------------- Python ---
+where python >nul 2>&1
+if errorlevel 1 (
+    echo   [FAIL] Python was not found on your PATH.
+    echo          Install Python 3.9 or newer and tick "Add python.exe to PATH".
+    echo          https://www.python.org/downloads/windows/
+    echo.
     pause
-    exit /b
+    exit /b 1
 )
 
-:: Quick check for placeholder values in config.yaml
-findstr /C:"your_spotify_client_id_here" config.yaml > nul
-if %errorlevel% equ 0 (
-    echo [WARNING] Default placeholder detected in config.yaml!
-    echo Please open config.yaml and replace "your_spotify_client_id_here"
-    echo with your actual Spotify Developer Client ID.
-    echo.
-    choice /M "Would you like to open config.yaml now"
-    if %errorlevel% equ 1 (
-        start notepad config.yaml
-        echo Edit the file, save it, and then run this launcher again.
-        pause
-        exit /b
+:: ------------------------------------------------------------ Virtualenv ---
+if exist "venv\Scripts\activate.bat" (
+    call "venv\Scripts\activate.bat"
+    echo   [ OK  ] Virtual environment activated.
+) else if exist "..\venv\Scripts\activate.bat" (
+    call "..\venv\Scripts\activate.bat"
+    echo   [ OK  ] Virtual environment activated ^(parent directory^).
+) else (
+    echo   [INFO ] No virtual environment found. Using system Python.
+)
+
+:: ---------------------------------------------------------------- Config ---
+:: config.yaml is gitignored, so a fresh clone will not have one. Create it and
+:: carry on: nothing in it is required to start.
+if not exist "config.yaml" (
+    if exist "config.example.yaml" (
+        copy /y "config.example.yaml" "config.yaml" >nul
+        echo   [INFO ] Created config.yaml from the example template.
+    ) else (
+        echo   [WARN ] Neither config.yaml nor config.example.yaml is present.
     )
 )
 
-set "SCRIPT_DIR=%~dp0"
-cd /d "%SCRIPT_DIR%"
+:: ------------------------------------------------------------- Centroids ---
+if not exist "data\test_library.db" (
+    echo   [INFO ] Building EQ profile database ^(first run^)...
+    python preprocess_safe.py --synthetic >nul 2>&1
+    if errorlevel 1 (
+        echo   [WARN ] Profile build failed. Run: python preprocess_safe.py --synthetic
+    )
+)
 
-:: Check and activate virtual environment
-if exist "venv\Scripts\activate.bat" (
-    echo [OK] Found local virtual environment. Activating...
-    call "venv\Scripts\activate.bat"
-) else if exist "..\venv\Scripts\activate.bat" (
-    echo [OK] Found virtual environment in parent directory. Activating...
-    call "..\venv\Scripts\activate.bat"
-) else (
-    echo [INFO] Virtual environment not detected. Running with system Python.
-    echo        If dependencies are missing, run: pip install -r requirements.txt
+:: ------------------------------------------------------------------ Icon ---
+:: Generated rather than committed as a binary, so it can be re-tuned in one
+:: place. Missing on a fresh clone, and the shortcut installer needs it.
+if not exist "static\favicon.ico" (
+    echo   [INFO ] Generating the app icon ^(first run^)...
+    python tools\make_icon.py >nul 2>&1
+    if errorlevel 1 echo   [WARN ] Icon build failed. Run: python tools\make_icon.py
 )
 
 echo.
-echo [INFO] Starting Sonic Vector Web Dashboard...
-echo [INFO] 1. Open http://127.0.0.1:5001 in your browser.
-echo [INFO] 2. Click "Connect Spotify Account" in the top bar.
-echo [INFO] 3. Approve the connection in the browser popup window to sync.
+
+:: -------------------------------------------------------------- Preflight --
+:: Reports what will and will not work, and refuses to start only if the DSP
+:: renderer self-test fails, since every headroom guarantee depends on it.
+python tools\preflight.py
+set "PREFLIGHT=!errorlevel!"
+
+if not "!PREFLIGHT!"=="0" (
+    echo.
+    echo   Start aborted. Fix the items above and run this launcher again.
+    echo.
+    pause
+    exit /b 1
+)
+
+:: Honour an override so the banner never advertises the wrong address.
+if "%SONICVECTOR_PORT%"=="" set "SONICVECTOR_PORT=5001"
+
 echo.
-echo [INFO] Close this window or press Ctrl+C to stop the server.
+echo   Dashboard:  http://127.0.0.1:%SONICVECTOR_PORT%
+echo   Stop:       close this window, or press Ctrl+C
+echo.
+
+:: Mention the shortcut installer once, and only while there is no shortcut to
+:: install. Repeating it every launch would just be noise.
+if not exist "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Sonic Vector.lnk" (
+    echo   Tip: run  python tools\install_shortcut.py  to add a desktop and
+    echo        Start Menu icon you can pin to the taskbar.
+    echo.
+)
+
+echo ============================================================================
 echo.
 
 python web_gui_app.py
+set "EXITCODE=!errorlevel!"
 
 echo.
-echo [INFO] Dashboard server stopped.
+if not "!EXITCODE!"=="0" (
+    echo   [FAIL] Sonic Vector exited with code !EXITCODE!.
+    echo          Scroll up for the traceback.
+) else (
+    echo   Sonic Vector stopped. The system EQ has been reset to flat.
+)
+echo.
 pause
+endlocal

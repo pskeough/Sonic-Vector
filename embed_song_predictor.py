@@ -24,6 +24,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
+# Descriptors that name a fault rather than a goal. They are matched and
+# reported like any other profile, but they are never blended in as a target.
+DEFECT_PROFILES = {"muddy"}
+
+
 class SemanticEQPredictor:
     """Manages the semantic text similarity model and EQ synthesis."""
 
@@ -153,7 +158,15 @@ class SemanticEQPredictor:
             "high_shelf_gain": 0.0,  "high_shelf_freq": 10000.0
         }
         
-        active_profiles = {p: w for p, w in weights.items() if w > 0.0}
+        # Defect descriptors name what an engineer removed, not a target to
+        # reproduce. Blending the "muddy" centroid additively boosted the mud
+        # (+3.7 dB low shelf, +4.5 dB at 298 Hz) on precisely the tracks a
+        # listener had described as muddy. Its weight still counts against
+        # airiness in dynamic_overlays(); it just cannot be a target here.
+        active_profiles = {
+            p: w for p, w in weights.items()
+            if w > 0.0 and p not in DEFECT_PROFILES
+        }
         if not active_profiles:
             # Return flat EQ if no profile is active
             return synthesized
@@ -204,7 +217,7 @@ Filter 5: ON HSC Fc {eq['high_shelf_freq']:.0f} Hz Gain {eq['high_shelf_gain']:.
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(config_content)
-        logger.info(f"✓ Equalizer APO config successfully updated at: {output_path}")
+        logger.info(f"OK: Equalizer APO config successfully updated at: {output_path}")
     except Exception as e:
         logger.error(f"Failed to write Equalizer APO config: {e}")
 
@@ -248,13 +261,13 @@ def run_manual_test(predictor: SemanticEQPredictor, lastfm: LastFMClient, apo_pa
                 track = query
                 
             if not artist or not track:
-                print("✗ Artist and Track are both required!")
+                print("FAILED: Artist and Track are both required!")
                 continue
                 
             # 1. Harvest Tags
             tags = lastfm.get_track_tags(artist, track)
             if not tags:
-                print(f"⚠ No tags returned for '{track}' by {artist}. Creating generic flat profile.")
+                print(f"WARNING: No tags returned for '{track}' by {artist}. Creating generic flat profile.")
                 
             # 2. Similarity
             weights = predictor.calculate_similarity_weights(tags)
@@ -285,7 +298,7 @@ def run_manual_test(predictor: SemanticEQPredictor, lastfm: LastFMClient, apo_pa
         except KeyboardInterrupt:
             break
         except Exception as e:
-            print(f"✗ Error during processing: {e}")
+            print(f"FAILED: Error during processing: {e}")
 
 
 def run_daemon_loop(predictor: SemanticEQPredictor, spotify: SpotifyAPIClient, lastfm: LastFMClient, apo_path: Path) -> None:

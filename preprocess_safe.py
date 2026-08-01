@@ -133,7 +133,7 @@ def generate_mock_dataset(output_path: Path, num_rows: int = 150) -> None:
             ]
             writer.writerow(row)
             
-    logger.info(f"✓ Mock dataset with {num_rows} records generated successfully!")
+    logger.info(f"OK: Mock dataset with {num_rows} records generated successfully!")
 
 
 def init_db(db_path: Path) -> None:
@@ -295,26 +295,54 @@ def process_dataset(csv_path: Path, db_path: Path) -> None:
                 final_count, centroid_json
             ))
             
-            logger.info(f"  ✓ Word: '{desc:<10}' | Submissions: {final_count:<3} | L-Shelf: {centroid['low_shelf_gain']:.1f}dB @ {centroid['low_shelf_freq']:.0f}Hz | H-Shelf: {centroid['high_shelf_gain']:.1f}dB @ {centroid['high_shelf_freq']:.0f}Hz")
+            logger.info(f"  OK: Word: '{desc:<10}' | Submissions: {final_count:<3} | L-Shelf: {centroid['low_shelf_gain']:.1f}dB @ {centroid['low_shelf_freq']:.0f}Hz | H-Shelf: {centroid['high_shelf_gain']:.1f}dB @ {centroid['high_shelf_freq']:.0f}Hz")
             
         conn.commit()
         
     logger.info("-" * 60)
-    logger.info("✓ Zero-dependency preprocessing completed successfully!")
+    logger.info("OK: Zero-dependency preprocessing completed successfully!")
     logger.info("-" * 60)
 
 
-def run_preprocessing():
-    """Main pipeline trigger."""
-    csv_path = Path("data/SAFEEqualiserUserData.csv")
-    db_path = Path("data/test_library.db")
-    
-    # Self-healing check
-    if not csv_path.exists():
-        generate_mock_dataset(csv_path)
-        
-    process_dataset(csv_path, db_path)
+# The real crowdsourced SAFE-DB export. Not shipped with this repo.
+REAL_CSV = Path("data/SAFEEqualiserUserData.csv")
+# Hand-authored synthetic stand-in. Useful for exercising the pipeline; it is
+# NOT crowdsourced data and must never be described as such.
+MOCK_CSV = Path("data/synthetic_priors.MOCK.csv")
+DB_PATH = Path("data/test_library.db")
+
+
+def run_preprocessing(allow_synthetic: bool = False):
+    """Build the centroid database.
+
+    This used to silently fabricate 150 rows whenever the real CSV was absent
+    and then process them as if they were engineer submissions, so the app's
+    "crowdsourced" profiles were in fact a round trip through this file's own
+    hardcoded means. Generating the stand-in is now explicit and opt-in.
+    """
+    if REAL_CSV.exists():
+        logger.info(f"Using real SAFE-DB export: {REAL_CSV}")
+        process_dataset(REAL_CSV, DB_PATH)
+        return
+
+    if not allow_synthetic:
+        raise SystemExit(
+            f"\nNo SAFE-DB export found at {REAL_CSV}.\n"
+            "This script will not invent one. Either supply the real export, "
+            f"or re-run with --synthetic to build hand-authored stand-in\n"
+            "priors, which are NOT crowdsourced data and must not be "
+            "presented as evidence of anything.\n"
+        )
+
+    if not MOCK_CSV.exists():
+        generate_mock_dataset(MOCK_CSV)
+    logger.warning(
+        "Building centroids from SYNTHETIC priors (%s). These are hand-authored "
+        "assumptions, not measurements.", MOCK_CSV
+    )
+    process_dataset(MOCK_CSV, DB_PATH)
 
 
 if __name__ == '__main__':
-    run_preprocessing()
+    import sys as _sys
+    run_preprocessing(allow_synthetic="--synthetic" in _sys.argv)

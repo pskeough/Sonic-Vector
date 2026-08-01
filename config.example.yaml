@@ -1,12 +1,29 @@
 # Sonic Vector Configuration File
-# Copy this to config.yaml and fill in your actual credentials
+# Copy this to config.yaml and fill in your actual credentials.
+# Nothing in this file is required: with an empty config the app still detects
+# what is playing (Windows media session), matches it, and applies the EQ.
 
-# Spotify API Credentials
+# Where "what is playing" comes from.
+#   auto    - Windows media session if available, else Spotify if configured
+#   windows - Windows media session only. No account, no network, and it sees
+#             every player on the PC: Spotify's app, a browser tab, VLC, games
+#   spotify - Spotify Web API only (requires the credentials below and a login)
+#   none    - no automatic detection; use the search box
+now_playing:
+  source: "auto"
+
+# Spotify API Credentials -- OPTIONAL.
+# Only needed for now_playing.source "spotify", and for genre enrichment.
 # Create an app at https://developer.spotify.com/dashboard
 spotify:
   client_id: "your_spotify_client_id_here"
   client_secret: "your_spotify_client_secret_here"
   redirect_uri: "http://127.0.0.1:8888/callback"
+
+# Last.fm API (crowdsourced track tags)
+# Get a key at https://www.last.fm/api/account/create
+lastfm:
+  api_key: "your_lastfm_api_key_here"
 
 # Google Gemini API
 # Get your API key from https://aistudio.google.com/apikey

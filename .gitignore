@@ -24,3 +24,17 @@ data/songs.db
 logs/
 *.log
 data/config.txt
+
+# Derived/synthetic data artifacts (rebuild with preprocess_safe.py)
+data/synthetic_priors.MOCK.csv
+data/test_library.db
+data/SAFEEqualiserUserData.csv
+
+# Rotated logs. The `*.log` rule above does not catch these: logging's
+# RotatingFileHandler appends the index AFTER the extension, so the rotated
+# files are sonicvector.log.1, .log.2 and so on. Half a megabyte each of
+# request noise and listening history.
+*.log.*
+
+# Personal EQ preference votes. Local to whoever is running it.
+data/preferences.db

@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SonicVectorEQ · Turntable View — Visual Prototype</title>
+<link rel="stylesheet" href="src/harness.css">
+
+<!-- three.js is vendored, not CDN-loaded. SonicVectorEQ is explicitly an
+     offline-first app: static/style.css records that the webfont CDN was
+     removed so first paint needs no network. A 3D view that silently
+     reintroduced that dependency would undo the decision. -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three/build/three.module.js",
+    "three/webgpu": "./vendor/three/build/three.module.js",
+    "three/tsl": "./vendor/three/build/three.module.js",
+    "three/addons/": "./vendor/three/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+
+<canvas id="stage"></canvas>
+
+<!-- ── Now-playing overlay ──────────────────────────────────────────────
+     Deliberately sparse. The turntable is the readout; this is just the
+     silkscreen under it, in the same three faces the console uses. -->
+<div class="np" id="np">
+  <div class="np-src" id="npSrc">SRC · IDLE</div>
+  <div class="np-title" id="npTitle">No Track Loaded</div>
+  <div class="np-artist" id="npArtist">Waiting for playback</div>
+  <div class="np-meta">
+    <span class="np-album" id="npAlbum"></span>
+    <span class="np-time" id="npTime">0:00 / 0:00</span>
+  </div>
+</div>
+
+<!-- ── State lamp ───────────────────────────────────────────────────────
+     Mirrors the console's LED language: amber = cueing/transition,
+     sage = playing, dark = stopped. -->
+<div class="lamp" id="lamp">
+  <span class="lamp-dot" id="lampDot"></span>
+  <span class="lamp-label" id="lampLabel">STOPPED</span>
+</div>
+
+<!-- ── Data source ──────────────────────────────────────────────────────
+     Says plainly where the deck is getting its playback from. Worth having
+     on screen permanently: "is this my music or the demo loop" is the first
+     question anyone asks, and a spinning record answers it wrongly. -->
+<div class="src" id="srcBadge" data-state="waiting">
+  <span class="src-dot"></span>
+  <span class="src-label" id="srcLabel">WAITING FOR APP</span>
+  <span class="src-detail" id="srcDetail"></span>
+</div>
+
+<!-- ── Control bar ──────────────────────────────────────────────────────
+     One slim strip along the bottom edge. Camera choice lives here because it
+     is the only control anyone reaches for repeatedly; everything else is
+     prototype scaffolding and folds away into the drawer above it, which is
+     closed by default so nothing sits over the deck. -->
+<div class="bar" id="bar">
+  <div class="bar-group">
+    <button class="tab" id="camHero" title="Hero — 1">HERO</button>
+    <button class="tab" id="camTop" title="Plan — 2">PLAN</button>
+    <button class="tab" id="camMacro" title="Macro — 3">MACRO</button>
+    <button class="tab" id="camFree" title="Free orbit — 4">FREE</button>
+  </div>
+
+  <span class="bar-sep"></span>
+
+  <div class="bar-group">
+    <button class="tab" id="btnLive" title="Use the running SonicVectorEQ app — R">LIVE</button>
+    <button class="tab" id="btnDemo" title="Use the built-in demo feed">DEMO</button>
+  </div>
+
+  <span class="bar-sep"></span>
+
+  <button class="tab tab-quiet" id="barMore" title="Prototype controls — H">TOOLS</button>
+</div>
+
+<!-- Prototype scaffolding. Closed by default; none of it ships. -->
+<div class="drawer" id="drawer" hidden>
+  <div class="drawer-row">
+    <span class="drawer-legend">TRANSPORT</span>
+    <button class="tab" id="btnPrev">‹ PREV</button>
+    <button class="tab" id="btnPlay">PAUSE</button>
+    <button class="tab" id="btnNext">NEXT ›</button>
+    <button class="tab" id="btnIdle">IDLE</button>
+    <span class="drawer-note">demo feed only</span>
+  </div>
+
+  <div class="drawer-row">
+    <span class="drawer-legend">POSITION</span>
+    <input type="range" id="seek" min="0" max="1000" value="0" class="slide">
+    <span class="readout" id="seekVal">0.0%</span>
+    <span class="drawer-legend">SPEED</span>
+    <input type="range" id="scale" min="1" max="120" value="1" class="slide">
+    <span class="readout" id="scaleVal">1×</span>
+  </div>
+
+  <div class="drawer-row">
+    <span class="drawer-legend">RENDER</span>
+    <label class="chk"><input type="checkbox" id="optPost" checked> POST</label>
+    <label class="chk"><input type="checkbox" id="optGrain" checked> GRAIN</label>
+    <label class="chk"><input type="checkbox" id="optDust" checked> DUST</label>
+    <label class="chk"><input type="checkbox" id="optStats"> STATS</label>
+  </div>
+</div>
+
+<div class="stats" id="stats" hidden>
+  <div><span>fps</span><b id="stFps">–</b></div>
+  <div><span>draw</span><b id="stDraw">–</b></div>
+  <div><span>tri</span><b id="stTri">–</b></div>
+  <div><span>state</span><b id="stState">–</b></div>
+</div>
+
+<div class="boot" id="boot">
+  <div class="boot-inner">
+    <div class="boot-mark"></div>
+    <div class="boot-text" id="bootText">Initialising renderer…</div>
+  </div>
+</div>
+
+<script type="module" src="src/main.js"></script>
+</body>
+</html>

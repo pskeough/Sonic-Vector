@@ -9,9 +9,10 @@ Includes an automatic artist-level fallback to guarantee tag retrieval.
 import logging
 import requests
 import time
+import os
 import yaml
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 # Set up clean logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -28,21 +29,35 @@ class LastFMClient:
             config_path: Path to config.yaml
         """
         self.config_path = Path(config_path)
-        
-        # Default active public key (fully functional fallback)
-        self.api_key = "75d20fb472be99275392aefa2760ea09"
-        
-        if self.config_path.exists():
+
+        # No key is embedded here. A live credential in git-tracked source is
+        # one clone away from being someone else's rate limit, and it was
+        # previously also sent over plaintext HTTP.
+        self.api_key = os.environ.get("LASTFM_API_KEY", "").strip()
+
+        if not self.api_key and self.config_path.exists():
             try:
                 with open(self.config_path, 'r') as f:
                     config_data = yaml.safe_load(f) or {}
-                
-                custom_key = config_data.get('lastfm', {}).get('api_key')
-                if custom_key:
-                    self.api_key = custom_key.strip()
-                    logger.info("Loaded custom Last.fm API key from configuration.")
+                key = config_data.get('lastfm', {}).get('api_key')
+                if key and not str(key).startswith("your_"):
+                    self.api_key = str(key).strip()
             except Exception as e:
-                logger.warning(f"Could not load custom Last.fm keys from config: {e}. Using fallback key.")
+                logger.warning(f"Could not read Last.fm key from config: {e}")
+
+        if self.api_key:
+            logger.info("Last.fm client ready.")
+        else:
+            logger.warning(
+                "No Last.fm API key configured (set lastfm.api_key in "
+                "config.yaml or the LASTFM_API_KEY environment variable). "
+                "Tag lookups will be skipped and the EQ will stay flat."
+            )
+
+    @property
+    def enabled(self) -> bool:
+        """Whether tag lookups can run at all."""
+        return bool(self.api_key)
 
     def get_artist_tags(self, artist: str) -> List[str]:
         """Fetch popular tags for a given artist as a fallback.
@@ -53,7 +68,9 @@ class LastFMClient:
         Returns:
             List of lower-case tag strings
         """
-        url = "http://ws.audioscrobbler.com/2.0/"
+        if not self.enabled:
+            return []
+        url = "https://ws.audioscrobbler.com/2.0/"
         params = {
             "method": "artist.getTopTags",
             "artist": artist,
@@ -92,9 +109,12 @@ class LastFMClient:
         Returns:
             List of lower-case tag strings (e.g. ['acoustic', 'sad', '70s'])
         """
+        if not self.enabled:
+            return []
+
         logger.info(f"Harvesting Last.fm tags for: '{track}' by {artist}...")
         
-        url = "http://ws.audioscrobbler.com/2.0/"
+        url = "https://ws.audioscrobbler.com/2.0/"
         params = {
             "method": "track.getInfo",
             "artist": artist,
@@ -134,15 +154,15 @@ class LastFMClient:
                     
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.HTTPError) as e:
                 if attempt == max_retries - 1:
-                    logger.error(f"✗ Last.fm track request failed after {max_retries} attempts: {e}")
+                    logger.error(f"FAILED: Last.fm track request failed after {max_retries} attempts: {e}")
                     break
                 sleep_time = backoff_factor ** attempt
-                logger.warning(f"⚠ Last.fm track connection issue: {e}. Retrying in {sleep_time:.2f}s... (Attempt {attempt+1}/{max_retries})")
+                logger.warning(f"WARNING: Last.fm track connection issue: {e}. Retrying in {sleep_time:.2f}s... (Attempt {attempt+1}/{max_retries})")
                 time.sleep(sleep_time)
 
         # Fail-safe fallback: If track tags are empty or too sparse (less than 3), pull artist tags!
         if len(tags) < 3:
-            logger.info(f"  → Track tags empty or sparse ({len(tags)}). Triggering artist-level fallback for '{artist}'...")
+            logger.info(f"  -> Track tags empty or sparse ({len(tags)}). Triggering artist-level fallback for '{artist}'...")
             artist_tags = self.get_artist_tags(artist)
             # Combine them, prioritizing track-level tags
             seen = set(tags)
@@ -151,7 +171,7 @@ class LastFMClient:
                     tags.append(t)
                     seen.add(t)
 
-        logger.info(f"  ✓ Successfully harvested {len(tags)} combined tags from Last.fm.")
+        logger.info(f"  OK: Successfully harvested {len(tags)} combined tags from Last.fm.")
         return tags
 
 

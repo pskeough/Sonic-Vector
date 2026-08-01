@@ -17,6 +17,20 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
+class SpotifyNotConfigured(Exception):
+    """Raised when no usable Spotify credentials are present.
+
+    This is an expected state, not an error: the app is designed to run without
+    Spotify. Callers should catch it and carry on with reduced functionality.
+    """
+
+
+def _is_configured(value: Optional[str]) -> bool:
+    """True when a credential is present and is not the example placeholder."""
+    text = str(value or "").strip()
+    return bool(text) and not text.startswith("your_")
+
+
 class SpotifyAPIClient:
     """Programmatic Spotify Web API client."""
 
@@ -40,8 +54,15 @@ class SpotifyAPIClient:
         self.client_id = config_data.get('spotify', {}).get('client_id')
         self.client_secret = config_data.get('spotify', {}).get('client_secret')
 
-        if not self.client_id or not self.client_secret:
-            raise ValueError("Missing Spotify client_id or client_secret in config.yaml!")
+        # Spotify is optional. An unconfigured install should say so once and
+        # move on, not fire a doomed token request and log a 400 as an ERROR,
+        # which reads like a fault rather than a choice the user made.
+        if not _is_configured(self.client_id) or not _is_configured(self.client_secret):
+            raise SpotifyNotConfigured(
+                "no credentials in config.yaml. Genre enrichment is off. "
+                "Now-playing detection is unaffected: that comes from the "
+                "Windows media session and needs no account."
+            )
 
         self.access_token: Optional[str] = None
         self.token_expires_in: int = 0
@@ -81,10 +102,10 @@ class SpotifyAPIClient:
             self.access_token = token_info.get("access_token")
             self.token_expires_in = token_info.get("expires_in", 3600)
             
-            logger.info("✓ Spotify authentication successful!")
+            logger.info("OK: Spotify authentication successful!")
             return True
         except Exception as e:
-            logger.error(f"✗ Failed to authenticate with Spotify: {e}")
+            logger.error(f"FAILED: Failed to authenticate with Spotify: {e}")
             return False
 
     def _get_auth_headers(self) -> Dict[str, str]:
@@ -134,20 +155,20 @@ class SpotifyAPIClient:
             except requests.exceptions.HTTPError as e:
                 status_code = e.response.status_code if e.response is not None else 500
                 if status_code in [400, 401, 403, 404]:
-                    logger.error(f"✗ Permanent HTTP error: {status_code} - {e}")
+                    logger.error(f"FAILED: Permanent HTTP error: {status_code} - {e}")
                     raise
                 if attempt == max_retries - 1:
-                    logger.error(f"✗ Request failed after {max_retries} attempts: {e}")
+                    logger.error(f"FAILED: Request failed after {max_retries} attempts: {e}")
                     raise
                 sleep_time = backoff_factor ** attempt
-                logger.warning(f"⚠ HTTP error {status_code}: {e}. Retrying in {sleep_time:.2f}s... (Attempt {attempt+1}/{max_retries})")
+                logger.warning(f"WARNING: HTTP error {status_code}: {e}. Retrying in {sleep_time:.2f}s... (Attempt {attempt+1}/{max_retries})")
                 time.sleep(sleep_time)
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
                 if attempt == max_retries - 1:
-                    logger.error(f"✗ Request failed after {max_retries} attempts: {e}")
+                    logger.error(f"FAILED: Request failed after {max_retries} attempts: {e}")
                     raise
                 sleep_time = backoff_factor ** attempt
-                logger.warning(f"⚠ Connection error or Timeout: {e}. Retrying in {sleep_time:.2f}s... (Attempt {attempt+1}/{max_retries})")
+                logger.warning(f"WARNING: Connection error or Timeout: {e}. Retrying in {sleep_time:.2f}s... (Attempt {attempt+1}/{max_retries})")
                 time.sleep(sleep_time)
 
     def get_track(self, track_id: str) -> Dict[str, Any]:
@@ -175,15 +196,25 @@ class SpotifyAPIClient:
         return self._make_api_request(f"artists/{artist_id}")
 
     def get_audio_features(self, track_id: str) -> Optional[Dict[str, Any]]:
-        """Fetch track's audio features (danceability, energy, key, valence, etc.).
+        """DEPRECATED BY SPOTIFY. Returns None on any app created after 2024-11-27.
 
-        Warning: May fail with 403/404 on general developer accounts due to late-2024 deprecations.
+        Spotify retired this endpoint on 2024-11-27. Only apps that already had
+        a quota extension granted or pending on that date can still call it;
+        every other client gets 403, permanently, and there is no replacement
+        and no appeal. See:
+        https://developer.spotify.com/blog/2024-11-27-changes-to-the-web-api
+
+        Nothing in the app depends on it: the EQ is derived from Last.fm tags
+        and Spotify artist genres, neither of which was affected. It is kept
+        only so an older script that imports it does not break, and so the next
+        person to reach for danceability/energy finds this note first rather
+        than spending an afternoon debugging a 403 that is working as intended.
 
         Args:
             track_id: Spotify track ID
 
         Returns:
-            API response containing audio features list, or None if deprecated/denied
+            API response containing audio features, or None (the usual case)
         """
         logger.info(f"Testing audio features endpoint for: {track_id}...")
         try:

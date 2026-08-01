@@ -6,7 +6,12 @@ recommends customized parametric EQ configurations and provides engineering just
 Gracefully handles write permissions and provides self-healing centroids fallback.
 """
 
+import atexit
+import base64
+import math
 import os
+import re
+import signal
 import sys
 import time
 import json
@@ -47,9 +52,13 @@ if config_path.exists():
 
 # Import clients, predictor, unified LLM client, and main SpotifyService
 from src.spotify.service import SpotifyService
-from src.utils import Config
+from src.utils import Config, is_placeholder, set_section_values
 from src.utils.llm_client import LLMClient
-from spotify_client import SpotifyAPIClient
+from src.dsp import apo, render
+from src import desktop
+from src.nowplaying import SmtcNowPlaying
+from src.preferences import PreferenceStore
+from spotify_client import SpotifyAPIClient, SpotifyNotConfigured
 from lastfm_client import LastFMClient
 from embed_song_predictor import SemanticEQPredictor, load_apo_path_from_config
 
@@ -62,28 +71,55 @@ app = Flask(__name__, static_folder='static', template_folder='templates')
 
 # State variables (thread-safe lock protected)
 state_lock = threading.Lock()
+# Serializes the whole snapshot-render-write sequence. Held across the APO
+# write so a slider drag during a track change cannot land out of order.
+commit_lock = threading.RLock()
 app_state = {
-    "mode": "auto",  
+    "mode": "auto",
     "ai_engine": "similarity",  # Default to similarity (Vector Centroids) instead of llm
     "sound_style": "balanced",  # "balanced", "bass_boost", "warm", "vocal", "chill", "loudness"
-    "apo_write_status": "success",  
+    "apo_write_status": "ok",
+    "apo_status": {"state": "unknown", "detail": "", "endpoints": []},
+    "bypass": False,
+    "output": {
+        "preamp_db": 0.0, "safety_preamp_db": 0.0, "user_trim_db": 0.0,
+        "limited": False, "limit_scale": 1.0, "headroom_peak_db": 0.0,
+        "bypassed": False, "response": []
+    },
+    # False unless an LLM provider is actually reachable. The engine dropdown
+    # hides the AI option when this is false, because an entry that cannot work
+    # is worse than no entry: picking it changed nothing and explained nothing.
+    "llm_available": False,
+    # "windows" | "spotify" | "none". Where now-playing comes from.
+    "now_playing_source": "none",
     "spotify_authenticated": False,
+    # False when no Spotify credentials are configured at all, which suppresses
+    # the "connect your account" strip. Opting out is a choice, not a problem.
+    "spotify_configured": False,
+    "spotify_redirect_uri": "http://127.0.0.1:8888/callback",
     "pipeline_status": {
-        "spotify": "Disconnected",
-        "playback": "Waiting for stream...",
+        "spotify": "Not configured (optional)",
+        "playback": "Search a track to start",
         "dsp_engine": "Vector Similarity Centroids",
         "apo_writer": "Not active"
     },
     "current_track": {
         "track_id": "",
-        "track_name": "No Track Playing",
-        "artist_name": "No Active Artist",
+        "track_name": "No Track Loaded",
+        "artist_name": "Search a track below to build a mix.",
         "album_name": "",
         "album_art": "",
         "genres": [],
         "tags": [],
         "weights": {},
-        "mixing_reason": "Equalizer flat. Stream music to load active mixing profile."
+        # "idle" | "spotify" | "search". The monitor thread may only replace a
+        # track it put there itself; see _set_idle_track_locked.
+        "source": "idle",
+        # Explicit, because every placeholder headline is a truthy string and
+        # "is a real song loaded?" used to be asked by comparing against a list
+        # of those strings, copied into six places and stale in four of them.
+        "placeholder": True,
+        "mixing_reason": "Equalizer flat. Search a track, or connect Spotify, to load a mixing profile."
     },
     "eq": {
         "low_shelf_gain": 0.0,   "low_shelf_freq": 120.0,
@@ -104,98 +140,410 @@ app_state = {
 # Core components initialized globally
 predictor = None
 lastfm = None
-spotify_client = None  
-spotify_oauth = None   
+spotify_client = None
+spotify_oauth = None
+# The active now-playing source. Either the Windows media session reader (no
+# account, no network, sees every player) or the Spotify OAuth service. Both
+# answer is_authenticated() and get_current_track(), so the monitor loop below
+# does not know or care which one it is holding.
+now_playing = None
+smtc_source = None     # kept separately: it also serves cached album art
 llm_client = None      # Unified LLM caller (Gemini/Llama.cpp)
 main_config = None     # Main project settings Config
 apo_path = None
+preferences = None    # listener vote log
 active_monitoring = True
 authenticating_lock = threading.Lock()
 is_authenticating = False
 
+# track_id the listener has personally adjusted this session. Only a track in
+# here may be written to the preference database; anything else would be the
+# app storing its own output and calling it a preference.
+user_edited_track_id = None
 
-def apply_and_write_apo():
-    """Merge EQ band gains, apply mix overlays, and write to Equalizer APO config.txt."""
-    global app_state, apo_path
-    
+
+def mark_user_edit():
+    """Record that the listener, not the algorithm, changed the current mix."""
+    global user_edited_track_id
     with state_lock:
-        eq = app_state["eq"].copy()
-        mix = app_state["mix"].copy()
-        
-    # Apply intensity multiplier (strength scale)
-    strength = mix["strength"]
-    low_shelf = eq["low_shelf_gain"] * strength
-    b1 = eq["first_band_gain"] * strength
-    b2 = eq["second_band_gain"] * strength
-    b3 = eq["third_band_gain"] * strength
-    high_shelf = eq["high_shelf_gain"] * strength
-    
-    # Apply mix enhancements overlays
-    low_shelf += mix["bass_boost"]
-    b2 += mix["vocal_clarity"]
-    b3 += mix["vocal_clarity"] * 0.5
-    high_shelf += mix["airiness"]
-    
-    # Build consolidated parameters
-    consolidated_eq = {
-        "low_shelf_freq": eq["low_shelf_freq"],
-        "low_shelf_gain": max(-15.0, min(15.0, low_shelf)),
-        "first_band_freq": eq["first_band_freq"],
-        "first_band_gain": max(-15.0, min(15.0, b1)),
-        "first_band_q": eq["first_band_q"],
-        "second_band_freq": eq["second_band_freq"],
-        "second_band_gain": max(-15.0, min(15.0, b2)),
-        "second_band_q": eq["second_band_q"],
-        "third_band_freq": eq["third_band_freq"],
-        "third_band_gain": max(-15.0, min(15.0, b3)),
-        "third_band_q": eq["third_band_q"],
-        "high_shelf_freq": eq["high_shelf_freq"],
-        "high_shelf_gain": max(-15.0, min(15.0, high_shelf)),
+        user_edited_track_id = app_state["current_track"].get("track_id") or None
+
+
+# The prompt in get_ai_predicted_eq() asks the model for gains at 60/250/1000/
+# 4000/12000 Hz, so those are the frequencies its answer must be applied at.
+# They used to be discarded and the gains applied at 120/250/1000/3500/10000,
+# which meant the model was scored against a filter set it was never shown.
+# Legacy headlines, kept only so a track dict written by an older build (or
+# recalled from a database row) is still recognised as a placeholder. New code
+# sets current_track["placeholder"] instead; see _is_placeholder.
+PLACEHOLDER_TRACK_NAMES = {
+    "", "No Track Playing", "No Track Loaded", "Spotify Player Paused",
+    "Spotify Account Not Connected", "Spotify private session active",
+    "No Active Spotify Playback", "Playback Not Supported",
+    "Spotify Account Disconnected", "Spotify Not Connected",
+}
+
+
+def _is_placeholder(track: dict) -> bool:
+    """True when current_track is a status message rather than a real song."""
+    if track.get("placeholder"):
+        return True
+    return str(track.get("track_name", "")) in PLACEHOLDER_TRACK_NAMES
+
+
+def idle_track(headline: str, detail: str, reason: str, album: str = "") -> dict:
+    """Build a placeholder current_track. Nothing here is a song."""
+    return {
+        "track_id": "",
+        "track_name": headline,
+        "artist_name": detail,
+        "album_name": album,
+        "album_art": "",
+        "genres": [],
+        "tags": [],
+        "weights": {},
+        "source": "idle",
+        "placeholder": True,
+        "mixing_reason": reason,
+        "is_playing": False,
+        "is_private_session": False,
     }
-    
-    # Custom format with Preamp
-    shelf_q = 0.71
-    config_content = f"""# Equalizer APO Parametric EQ Configuration
-# Synthesized dynamically by EqualizerAI Web Dashboard
-# Last updated: {time.strftime('%Y-%m-%d %H:%M:%S')}
 
-Preamp: {mix['preamp_gain']:.2f} dB
 
-# 5-Band Parametric Filter Array
-Filter 1: ON LSC Fc {consolidated_eq['low_shelf_freq']:.0f} Hz Gain {consolidated_eq['low_shelf_gain']:.2f} dB Q {shelf_q:.2f}
-Filter 2: ON PK Fc {consolidated_eq['first_band_freq']:.0f} Hz Gain {consolidated_eq['first_band_gain']:.2f} dB Q {consolidated_eq['first_band_q']:.2f}
-Filter 3: ON PK Fc {consolidated_eq['second_band_freq']:.0f} Hz Gain {consolidated_eq['second_band_gain']:.2f} dB Q {consolidated_eq['second_band_q']:.2f}
-Filter 4: ON PK Fc {consolidated_eq['third_band_freq']:.0f} Hz Gain {consolidated_eq['third_band_gain']:.2f} dB Q {consolidated_eq['third_band_q']:.2f}
-Filter 5: ON HSC Fc {consolidated_eq['high_shelf_freq']:.0f} Hz Gain {consolidated_eq['high_shelf_gain']:.2f} dB Q {shelf_q:.2f}
-"""
-    
-    write_success = False
-    path_exists = False
-    
-    try:
-        if apo_path.parent.exists():
-            path_exists = True
-            with open(apo_path, 'w', encoding='utf-8') as f:
-                f.write(config_content)
-            write_success = True
-    except Exception as e:
-        logger.error(f"Failed to write Equalizer APO config: {e}")
-        
-    try:
-        backup_path = Path("data/config.txt")
-        backup_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(backup_path, 'w', encoding='utf-8') as f:
-            f.write(config_content)
-    except Exception:
-        pass
-        
-    with state_lock:
-        if not path_exists:
-            app_state["apo_write_status"] = "not_found"
-        elif not write_success:
-            app_state["apo_write_status"] = "permission_denied"
+def _set_idle_track_locked(track: dict) -> None:
+    """Publish a placeholder, unless the listener loaded a track by hand.
+
+    The monitor thread used to overwrite current_track unconditionally every
+    1.5 s. With no Spotify account linked that meant a track loaded through the
+    search box survived for one poll and was then replaced by "Spotify Account
+    Not Connected", which took the tags, the profile weights, Remix, Analyze
+    and the rating buttons down with it. Searching is the supported way to use
+    this app without Spotify, so a search result outranks a status message.
+
+    Caller must hold state_lock.
+    """
+    if app_state["current_track"].get("source") == "search":
+        return
+    app_state["current_track"] = track
+
+
+def spotify_idle_track() -> dict:
+    """The placeholder that fits however now-playing is currently set up."""
+    source = app_state.get("now_playing_source")
+
+    if source == "windows":
+        return idle_track(
+            "Nothing Playing",
+            "Press play in any app and this will follow it.",
+            "Watching the Windows media session. Start a track in Spotify, a "
+            "browser, or any other player and it will be detected and mixed "
+            "automatically. No account required.",
+        )
+
+    if source == "spotify":
+        return idle_track(
+            "Spotify Not Connected",
+            "Click CONNECT SPOTIFY above, or search a track below.",
+            "Spotify credentials are configured but the account is not linked yet. "
+            "Authorize it to auto-detect now-playing, or just search a track.",
+        )
+
+    return idle_track(
+        "No Track Loaded",
+        "Search a track below to build a mix.",
+        "Equalizer flat. Search any song to analyze it and load a mixing profile. "
+        "Automatic detection is unavailable on this machine; the search box does "
+        "everything else.",
+    )
+
+
+def _refresh_pipeline_locked(auth_ok: bool, track_info=None) -> None:
+    """Recompute the four signal-path rows. Caller must hold state_lock.
+
+    This used to live at the tail of the monitor loop, after four `continue`
+    statements, so on an install without Spotify it never ran once: the panel
+    reported "Waiting for stream..." and an unexplained "Disconnected" for the
+    entire session no matter what the app was actually doing.
+    """
+    track = app_state["current_track"]
+    configured = app_state.get("spotify_configured")
+    source = app_state.get("now_playing_source")
+
+    if source == "windows":
+        app_state["pipeline_status"]["spotify"] = "Windows media session (no account)"
+    elif auth_ok:
+        app_state["pipeline_status"]["spotify"] = "Connected (OAuth active)"
+    elif configured:
+        app_state["pipeline_status"]["spotify"] = "Not linked (click Connect)"
+    else:
+        app_state["pipeline_status"]["spotify"] = "Not configured (optional)"
+
+    if track.get("source") == "search":
+        app_state["pipeline_status"]["playback"] = f"Loaded by search: '{track['track_name']}'"
+    elif not auth_ok:
+        app_state["pipeline_status"]["playback"] = (
+            "Waiting for Spotify connection..." if configured
+            else "Search a track to start")
+    elif source == "windows" and not track_info:
+        app_state["pipeline_status"]["playback"] = "Watching for playback on this PC..."
+    elif not track_info:
+        app_state["pipeline_status"]["playback"] = "Waiting for stream in Spotify app..."
+    elif track_info.get("is_private_session"):
+        app_state["pipeline_status"]["playback"] = "Blocked (private session active)"
+    elif _is_placeholder(track):
+        app_state["pipeline_status"]["playback"] = "Unsupported content (Local/Ad/Podcast)"
+    else:
+        app_state["pipeline_status"]["playback"] = f"Active: '{track['track_name']}'"
+
+    if _is_placeholder(track):
+        app_state["pipeline_status"]["dsp_engine"] = "Idle (waiting for a track)"
+    elif app_state["ai_engine"] == "similarity":
+        app_state["pipeline_status"]["dsp_engine"] = "Keyword profile matching"
+    else:
+        app_state["pipeline_status"]["dsp_engine"] = "AI mixing assistant"
+
+    # A successful file write means nothing if APO is not attached to the
+    # output the listener is actually using, so the write status alone must
+    # never be reported as "active".
+    write_st = app_state["apo_write_status"]
+    apo_state = app_state["apo_status"].get("state", "unknown")
+    if write_st == "denied":
+        app_state["pipeline_status"]["apo_writer"] = "Cannot write config.txt (permission denied)"
+    elif write_st == "path_missing":
+        app_state["pipeline_status"]["apo_writer"] = "Equalizer APO config folder not found"
+    elif write_st != "ok":
+        app_state["pipeline_status"]["apo_writer"] = "Failed to write config.txt"
+    elif apo_state == "apo_not_installed":
+        app_state["pipeline_status"]["apo_writer"] = "Equalizer APO is not installed"
+    elif apo_state == "apo_no_active_endpoint":
+        app_state["pipeline_status"]["apo_writer"] = "Not applied: APO is not enabled on your current output"
+    elif app_state["bypass"]:
+        app_state["pipeline_status"]["apo_writer"] = "Bypassed (comparing against flat)"
+    elif apo_state == "apo_ready":
+        app_state["pipeline_status"]["apo_writer"] = "EQ active on your output"
+    else:
+        app_state["pipeline_status"]["apo_writer"] = "config.txt written (APO status unknown)"
+
+
+def describe_mix(weights: dict, sound_style: str, verb: str = "Synthesized") -> str:
+    """Explain the curve in the signal-path note.
+
+    Tracks the matcher has no opinion about are common and legitimate: an
+    obscure release simply has no Last.fm tags that map to a profile. That case
+    used to render as "blended using preprocessed SAFE centroids ()", an empty
+    list presented as an achievement, which reads like a bug because it looks
+    like one.
+    """
+    style_desc = sound_style.replace("_", " ").title()
+    active = [f"{p} ({w * 100:.0f}%)" for p, w in (weights or {}).items() if w > 0]
+
+    if not active:
+        return (f"No profile keywords matched this track's tags, so the EQ stays "
+                f"flat apart from the '{style_desc}' voicing. Tune it by hand and "
+                f"the setting is remembered for this track.")
+
+    return (f"{verb} curves blended using preprocessed SAFE centroids "
+            f"({', '.join(active)}) and styled as '{style_desc}'.")
+
+
+def llm_available() -> bool:
+    """Whether the optional AI mixing engine has anything to talk to.
+
+    This app is designed to run on no API keys at all, so the AI engine is a
+    bonus path, never the working assumption. A local OpenAI-compatible server
+    needs no key and counts as available; the hosted provider needs one and
+    without it the engine is not offered at all, rather than being offered and
+    then silently falling back on every track.
+    """
+    if llm_client is None or main_config is None:
+        return False
+    if main_config.llm_provider != "gemini":
+        return True
+    return not is_placeholder(main_config.gemini_api_key)
+
+
+def llm_fallback_note(exc: Exception) -> str:
+    """Prefix for mixing_reason when the AI engine could not answer.
+
+    The fallback to keyword matching was silent, so on an install with no
+    Gemini key (the shipped default) choosing "AI MIXING ASSISTANT" changed the
+    curve slightly, reported a keyword-matching explanation, and never said why
+    the engine it named was not the one that ran.
+    """
+    reason = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+    if len(reason) > 140:
+        reason = reason[:137] + "..."
+    return (f"AI mixing assistant unavailable ({reason}). Fell back to keyword "
+            f"profile matching. ")
+
+
+LLM_BAND_FREQS = {
+    "low_shelf_freq": 60.0,
+    "first_band_freq": 250.0, "first_band_q": 0.71,
+    "second_band_freq": 1000.0, "second_band_q": 0.71,
+    "third_band_freq": 4000.0, "third_band_q": 0.71,
+    "high_shelf_freq": 12000.0,
+}
+
+
+def blend_curve(interpolated: dict, sound_style: str) -> dict:
+    """Combine an interpolated centroid with the style offset, keeping the
+    centroid's own band placement.
+
+    The web path used to overwrite every frequency with a fixed 120/250/1000/
+    3500/10000 Hz grid and copy across only the five gains, so the punchy
+    centroid's 68.9 Hz shelf was applied at 120 Hz and its 3007 Hz snap band
+    landed at 1000 Hz, in the honk region. The CLI path kept the interpolated
+    values, so the two emitted different EQ from identical weights.
+    """
+    offsets = STYLE_OFFSETS.get(sound_style, STYLE_OFFSETS["balanced"])
+    out = dict(interpolated)
+    for key, offset in offsets.items():
+        out[key] = interpolated.get(key, 0.0) + offset
+    return out
+
+
+def _set_eq_locked(eq_curve: dict) -> None:
+    """Copy a curve into app_state['eq']. Caller must hold state_lock.
+
+    Frequencies and Qs are copied when the curve carries them, so a profile's
+    own band placement survives rather than being flattened onto a fixed grid.
+    """
+    for key in app_state["eq"]:
+        if key in eq_curve:
+            app_state["eq"][key] = float(eq_curve[key])
+
+
+def dynamic_overlays(weights: dict) -> dict:
+    """Derive the mastering overlay sliders from the active profile weights.
+
+    `muddy` is a defect descriptor. Someone tagging a track "muddy", "boxy" or
+    "boomy" is naming what they would remove, not a target to reproduce, so it
+    only ever subtracts here and it is excluded from the additive centroid
+    blend for the same reason. The previous code blended the muddy centroid
+    additively (+3.7 dB low shelf, +4.5 dB at 298 Hz), which boosted the mud
+    on exactly the tracks a listener had complained about.
+
+    The preamp is deliberately not computed here. commit_state() derives it
+    from the realized filter cascade, which is the only place with enough
+    information to get it right.
+    """
+    def w(profile: str) -> float:
+        return weights.get(profile, 0.0)
+
+    bass_boost = max(0.0, min(8.0, round(
+        w("punchy") * 4.0 + w("warm") * 1.5 - w("bright") * 1.0, 1)))
+    vocal_clarity = max(0.0, min(6.0, round(
+        w("presence") * 3.0 + w("warm") * 1.0, 1)))
+    airiness = max(0.0, min(6.0, round(
+        w("airy") * 3.0 + w("bright") * 1.5 - w("muddy") * 1.5, 1)))
+
+    return {
+        "preamp_gain": 0.0,
+        "strength": 1.0,
+        "bass_boost": bass_boost,
+        "vocal_clarity": vocal_clarity,
+        "airiness": airiness,
+    }
+
+
+def _composite_eq(eq: dict, mix: dict) -> dict:
+    """Merge the band gains and the overlay sliders into one filter set.
+
+    This is the only place the overlays are folded in. Previously the same
+    arithmetic appeared in four places and drifted between them.
+    """
+    strength = mix["strength"]
+    out = dict(eq)
+    out["low_shelf_gain"] = eq["low_shelf_gain"] * strength + mix["bass_boost"]
+    out["first_band_gain"] = eq["first_band_gain"] * strength
+    out["second_band_gain"] = eq["second_band_gain"] * strength + mix["vocal_clarity"]
+    out["third_band_gain"] = eq["third_band_gain"] * strength + mix["vocal_clarity"] * 0.5
+    out["high_shelf_gain"] = eq["high_shelf_gain"] * strength + mix["airiness"]
+    return out
+
+
+def commit_state():
+    """Render the current state to a filter set and publish it to Equalizer APO.
+
+    Every path that changes the sound goes through here, under one lock, so
+    a slider drag during a track change cannot interleave with the monitor
+    thread and write curves out of order.
+
+    The preamp is derived from the realized cascade rather than guessed from
+    the overlay sliders. The previous rule (-0.8 * max of three sliders)
+    ignored the band gains entirely and let the composite response reach
+    +8.5 dB above unity on ordinary material.
+    """
+    global app_state, apo_path
+
+    with commit_lock:
+        with state_lock:
+            eq = app_state["eq"].copy()
+            mix = app_state["mix"].copy()
+            bypassed = app_state["bypass"]
+
+        composite = _composite_eq(eq, mix)
+        budgeted, limited, scale = render.apply_headroom_budget(composite)
+
+        # User trim rides on top of the safety preamp, never replaces it.
+        user_trim = max(-12.0, min(0.0, float(mix.get("preamp_gain", 0.0))))
+        safety_preamp = render.required_preamp_db(budgeted)
+        preamp = max(render.PREAMP_FLOOR_DB, safety_preamp + user_trim)
+
+        if bypassed:
+            # Level-matched flat arm, so the comparison is about tone rather
+            # than about which side is louder. Analytic match; see
+            # render.pink_weighted_mean_db.
+            emitted = dict(apo.FLAT_EQ)
+            emitted_preamp = max(
+                render.PREAMP_FLOOR_DB,
+                min(0.0, preamp + render.pink_weighted_mean_db(budgeted)),
+            )
+            note = "BYPASS (level-matched, assumed spectrum)"
         else:
-            app_state["apo_write_status"] = "success"
+            emitted = budgeted
+            emitted_preamp = preamp
+            note = f"headroom-limited to {scale:.3f} of requested" if limited else ""
+
+        text = apo.build_config_text(emitted, emitted_preamp, note)
+        status = apo.write_config_atomic(apo_path, text)
+
+        # Local mirror, useful when APO is not installed or not registered.
+        apo.write_config_atomic(PROJECT_ROOT / "data" / "config.txt", text)
+
+        headroom_peak = max(render.render_curve(emitted)) + emitted_preamp
+
+        with state_lock:
+            app_state["apo_write_status"] = status
+            app_state["output"] = {
+                "preamp_db": round(emitted_preamp, 2),
+                "safety_preamp_db": round(safety_preamp, 2),
+                "user_trim_db": round(user_trim, 2),
+                "limited": limited,
+                "limit_scale": round(scale, 4),
+                "headroom_peak_db": round(headroom_peak, 3),
+                "bypassed": bypassed,
+                "response": render.response_points(emitted, emitted_preamp),
+            }
+
+
+def write_flat_config(reason: str = "shutdown"):
+    """Leave the system EQ flat. Called at startup and on every exit path.
+
+    Without this, killing the app left whatever curve was last written applied
+    to every sound on the machine, indefinitely.
+    """
+    global apo_path
+    try:
+        text = apo.build_config_text(
+            apo.FLAT_EQ, 0.0, f"flat ({reason}) - Sonic Vector is not running"
+        )
+        apo.write_config_atomic(apo_path, text)
+        apo.write_config_atomic(PROJECT_ROOT / "data" / "config.txt", text)
+        logger.info(f"Equalizer APO config reset to flat ({reason}).")
+    except Exception as e:
+        logger.error(f"Failed to reset Equalizer APO config to flat: {e}")
 
 
 def save_track_eq_to_db(track_id, track_name, artist_name, album_name, eq_gains, mix_settings=None):
@@ -292,7 +640,7 @@ def save_track_eq_to_db(track_id, track_name, artist_name, album_name, eq_gains,
                 mix_settings.get("airiness", 0.0)
             ))
             conn.commit()
-            logger.info(f"✓ Saved track EQ & Mix overlays to songs database for '{track_name}' by {artist_name}")
+            logger.info(f"OK: Saved track EQ & Mix overlays to songs database for '{track_name}' by {artist_name}")
     except Exception as e:
         logger.error(f"Failed to save track EQ mix to database: {e}")
 
@@ -395,10 +743,15 @@ STYLE_PROMPT_INSTRUCTIONS = {
 def get_ai_predicted_eq(track_name: str, artist_name: str, genres: list, tags: list, sound_style: str = "balanced") -> dict:
     """Uses the unified LLMClient to query the active AI server (Llama/Gemini) for custom EQ parameters."""
     global llm_client, main_config
-    
+
     if not llm_client:
         raise RuntimeError("LLM client not initialized.")
-        
+
+    # Say "no key" rather than letting the provider answer with a raw 400 that
+    # the listener then sees quoted in the signal-path note.
+    if not llm_available():
+        raise RuntimeError("no LLM provider is configured")
+
     genres_str = ", ".join(genres) if genres else "Unknown"
     tags_str = ", ".join(tags[:10]) if tags else "Unknown"
     style_instruction = STYLE_PROMPT_INSTRUCTIONS.get(sound_style, STYLE_PROMPT_INSTRUCTIONS["balanced"])
@@ -469,16 +822,85 @@ REQUIRED JSON FORMAT:
             "mixing_reason": result.get("mixing_reason", "AI mix profile loaded successfully.")
         }
         
-        logger.info(f"✓ AI Mixing success: {eq_curve}")
+        logger.info(f"OK: AI Mixing success: {eq_curve}")
         return eq_curve
     except Exception as e:
         logger.error(f"Failed to fetch AI Mixing Assistant parameters: {e}")
         raise e
 
 
+def _looks_like_spotify_id(track_id: str) -> bool:
+    """Spotify IDs are 22-character base62. SMTC keys are 16 hex characters."""
+    return bool(track_id) and len(track_id) == 22 and track_id.isalnum()
+
+
+def fetch_artist_genres(track_id: str, track_name: str, artist_name: str) -> list:
+    """Artist genres for a track, whichever source identified it.
+
+    Pure enrichment: genres widen the tag set the centroid matcher sees, and
+    the app is perfectly happy with none. It needs only Spotify's app
+    credentials, never a logged-in user, so it works on the Windows path too.
+
+    The Windows media session has no track IDs, so a track identified that way
+    is looked up by name first. Calling get_track() with a 16-hex local key
+    would just be a guaranteed 400.
+    """
+    if spotify_client is None or not track_name:
+        return []
+
+    try:
+        if _looks_like_spotify_id(track_id):
+            track_data = spotify_client.get_track(track_id)
+        else:
+            query = f"track:{track_name}"
+            if artist_name:
+                query += f" artist:{artist_name}"
+            items = (spotify_client.search_track(query) or {}) \
+                .get("tracks", {}).get("items", [])
+            if not items:
+                return []
+            track_data = items[0]
+
+        artist_id = track_data["artists"][0]["id"]
+        return spotify_client.get_artist(artist_id).get("genres", []) or []
+    except Exception as e:
+        logger.debug(f"Genre enrichment unavailable for '{track_name}': {e}")
+        return []
+
+
+def _autosave_previous_track(last_track_id: str) -> None:
+    """Persist the outgoing track's mix, but only if the listener shaped it.
+
+    Saving unconditionally means storing the app's own output as if it were a
+    preference and then recalling it forever: once a track had been heard, the
+    style and engine dropdowns became silent no-ops for it. The track-change
+    path was fixed for that, but the stop, private-session and unsupported-
+    content paths still saved unconditionally, so merely pausing Spotify
+    latched the auto-generated curve onto the song. All four now come here.
+    """
+    if not last_track_id or user_edited_track_id != last_track_id:
+        return
+
+    with state_lock:
+        track = app_state["current_track"].copy()
+        gains = app_state["eq"].copy()
+        mix = app_state["mix"].copy()
+
+    if _is_placeholder(track):
+        return
+
+    save_track_eq_to_db(last_track_id, track.get("track_name"),
+                        track.get("artist_name"), track.get("album_name"),
+                        gains, mix)
+
+
 def monitor_spotify_playback():
-    """Background loop polling active Spotify playback via direct OAuth get_current_track()."""
-    global app_state, predictor, lastfm, spotify_client, spotify_oauth, active_monitoring
+    """Background loop polling the active now-playing source for track changes.
+
+    Source-agnostic: it holds whatever _select_now_playing_source picked, which
+    is normally the Windows media session and only falls back to Spotify OAuth.
+    The name is kept because the launcher and the tests reference it."""
+    global app_state, predictor, lastfm, spotify_client, now_playing, active_monitoring
     
     logger.info("Background direct Spotify User playback thread started.")
     last_track_id = None
@@ -491,124 +913,107 @@ def monitor_spotify_playback():
             log_throttled = (now - last_status_log_time) > 10.0
             
             auth_ok = False
-            if spotify_oauth:
+            if now_playing:
                 try:
-                    auth_ok = spotify_oauth.is_authenticated()
+                    auth_ok = now_playing.is_authenticated()
                 except Exception as e:
                     logger.debug(f"Auth check failed: {e}")
             
+            # auth_ok means "the now-playing source is ready", which is a
+            # different claim from "a Spotify account is linked". Conflating
+            # them made the Windows source light up the Spotify connected
+            # state. They are now answered separately: the account can be
+            # linked while Windows does the detecting, and usually will be.
+            if now_playing is spotify_oauth:
+                spotify_linked = auth_ok
+            elif spotify_oauth is not None:
+                try:
+                    spotify_linked = spotify_oauth.is_authenticated()
+                except Exception:
+                    spotify_linked = False
+            else:
+                spotify_linked = False
+
             with state_lock:
-                app_state["spotify_authenticated"] = auth_ok
+                app_state["spotify_authenticated"] = spotify_linked
                 current_mode = app_state["mode"]
                 current_engine = app_state["ai_engine"]
                 sound_style = app_state["sound_style"]
             
             if not auth_ok:
                 with state_lock:
-                    app_state["current_track"] = {
-                        "track_id": "",
-                        "track_name": "Spotify Account Not Connected",
-                        "artist_name": "Please click Connect Spotify above to authorize.",
-                        "album_name": "",
-                        "album_art": "",
-                        "genres": [],
-                        "tags": [],
-                        "weights": {},
-                        "mixing_reason": "Spotify integration requires dynamic OAuth connection.",
-                        "is_playing": False,
-                        "is_private_session": False
-                    }
-                if log_throttled:
-                    logger.warning("[Spotify Monitor] Spotify Account is NOT authorized. Please open http://127.0.0.1:5001 and click 'Connect Spotify Account'.")
+                    _set_idle_track_locked(spotify_idle_track())
+                    _refresh_pipeline_locked(auth_ok=False)
+                    configured = app_state["spotify_configured"]
+                # Not having Spotify set up is a supported configuration, not a
+                # fault, so it is not worth a WARNING every ten seconds for the
+                # life of the process. Only nag when credentials exist and the
+                # account is simply not linked yet.
+                if log_throttled and configured:
+                    logger.info("[Monitor] Spotify is configured but not linked. "
+                                "Open the dashboard and click 'Connect Spotify'.")
                     last_status_log_time = now
                 time.sleep(2.0)
                 continue
-                
+
             # ALWAYS poll Spotify playback even in manual override, to detect song changes and auto-save!
             track_info = None
             try:
-                track_info = spotify_oauth.get_current_track()
+                track_info = now_playing.get_current_track()
             except Exception as e:
                 logger.warning(f"Error fetching direct current track: {e}")
                 
             # Case 1: No active session (device disconnected / Spotify closed)
             if not track_info:
-                # Trigger auto-save of previous track's custom settings on stop
-                if last_track_id:
-                    with state_lock:
-                        prev_track_name = app_state["current_track"].get("track_name")
-                        prev_artist_name = app_state["current_track"].get("artist_name")
-                        prev_album_name = app_state["current_track"].get("album_name")
-                        current_gains = app_state["eq"].copy()
-                        current_mix = app_state["mix"].copy()
-                    
-                    if prev_track_name and prev_track_name not in [
-                        "No Track Playing", "Spotify Player Paused", "Spotify Account Not Connected", 
-                        "🔒 Spotify Private Session Active", "No Active Spotify Playback", 
-                        "Playback Not Supported", "Spotify Account Disconnected"
-                    ]:
-                        save_track_eq_to_db(last_track_id, prev_track_name, prev_artist_name, prev_album_name, current_gains, current_mix)
-                    last_track_id = None
+                _autosave_previous_track(last_track_id)
+                last_track_id = None
 
                 with state_lock:
-                    app_state["current_track"] = {
-                        "track_id": "",
-                        "track_name": "No Active Spotify Playback",
-                        "artist_name": "Open your Spotify app and play a song to auto-master.",
-                        "album_name": "Waiting for active player session...",
-                        "album_art": "",
-                        "genres": [],
-                        "tags": [],
-                        "weights": {},
-                        "mixing_reason": "No active playback session detected. Open Spotify on your phone or PC, start streaming, and make sure it is playing.",
-                        "is_playing": False,
-                        "is_private_session": False
-                    }
+                    if app_state["now_playing_source"] == "windows":
+                        _set_idle_track_locked(idle_track(
+                            "Nothing Playing",
+                            "Press play in any app and this will follow it.",
+                            "Watching the Windows media session. Start a track in any "
+                            "player on this PC and it will be detected and mixed.",
+                        ))
+                    else:
+                        _set_idle_track_locked(idle_track(
+                            "No Active Spotify Playback",
+                            "Open your Spotify app and play a song to auto-master.",
+                            "No active playback session detected. Open Spotify on your phone "
+                            "or PC and start streaming, or search a track below to mix it by hand.",
+                            album="Waiting for active player session...",
+                        ))
+                    _refresh_pipeline_locked(auth_ok=True, track_info=None)
                 if log_throttled:
-                    logger.info("[Spotify Monitor] Listening... Connected to account successfully, but no active device playback session detected. Play a song on your phone/PC app!")
+                    logger.info("[Monitor] Listening, but nothing is playing yet.")
                     last_status_log_time = now
                 time.sleep(1.5)
                 continue
-                
+
             # Case 2: Spotify Private Session Active (Blocks API metadata)
             if track_info.get("is_private_session"):
-                # Trigger auto-save of previous track on private session block
-                if last_track_id:
-                    with state_lock:
-                        prev_track_name = app_state["current_track"].get("track_name")
-                        prev_artist_name = app_state["current_track"].get("artist_name")
-                        prev_album_name = app_state["current_track"].get("album_name")
-                        current_gains = app_state["eq"].copy()
-                        current_mix = app_state["mix"].copy()
-                    
-                    if prev_track_name and prev_track_name not in [
-                        "No Track Playing", "Spotify Player Paused", "Spotify Account Not Connected", 
-                        "🔒 Spotify Private Session Active", "No Active Spotify Playback", 
-                        "Playback Not Supported", "Spotify Account Disconnected"
-                    ]:
-                        save_track_eq_to_db(last_track_id, prev_track_name, prev_artist_name, prev_album_name, current_gains, current_mix)
-                    last_track_id = None
+                _autosave_previous_track(last_track_id)
+                last_track_id = None
 
                 with state_lock:
-                    app_state["current_track"] = {
-                        "track_id": "",
-                        "track_name": "🔒 Spotify Private Session Active",
-                        "artist_name": "Disable 'Private Session' in Spotify Settings to allow EQ sync.",
-                        "album_name": "Spotify is blocking metadata retrieval",
-                        "album_art": "",
-                        "genres": [],
-                        "tags": [],
-                        "weights": {},
-                        "mixing_reason": "Your Spotify client is in a private session. Spotify blocks song metadata queries while in Private Session for privacy. Turn off 'Private Session' in Spotify app settings to begin auto-mastering!",
-                        "is_playing": False,
-                        "is_private_session": True
-                    }
+                    private = idle_track(
+                        "Spotify private session active",
+                        "Disable 'Private Session' in Spotify Settings to allow EQ sync.",
+                        "Your Spotify client is in a private session. Spotify blocks song "
+                        "metadata queries while in Private Session for privacy. Turn off "
+                        "'Private Session' in Spotify app settings to begin auto-mastering!",
+                        album="Spotify is blocking metadata retrieval",
+                    )
+                    private["is_private_session"] = True
+                    _set_idle_track_locked(private)
+                    _refresh_pipeline_locked(auth_ok=True, track_info=track_info)
                 if log_throttled:
                     logger.warning("[WARNING] Spotify Private Session detected! Disabling 'Private Session' in Spotify (Profile icon -> Settings -> Private Session) is required to read tracks and auto-mix.")
                     last_status_log_time = now
                 time.sleep(2.5)
                 continue
-                
+
             track_uri = track_info.get("track_uri", "")
             track_id = track_uri.split(":")[-1] if track_uri else ""
             track_name = track_info.get("name", "")
@@ -619,39 +1024,20 @@ def monitor_spotify_playback():
             
             # Case 3: Untrackable content (local file, podcast, ad)
             if not track_id or not track_name or track_name == "Unknown":
-                # Trigger auto-save of previous track on untrackable content
-                if last_track_id:
-                    with state_lock:
-                        prev_track_name = app_state["current_track"].get("track_name")
-                        prev_artist_name = app_state["current_track"].get("artist_name")
-                        prev_album_name = app_state["current_track"].get("album_name")
-                        current_gains = app_state["eq"].copy()
-                        current_mix = app_state["mix"].copy()
-                    
-                    if prev_track_name and prev_track_name not in [
-                        "No Track Playing", "Spotify Player Paused", "Spotify Account Not Connected", 
-                        "🔒 Spotify Private Session Active", "No Active Spotify Playback", 
-                        "Playback Not Supported", "Spotify Account Disconnected"
-                    ]:
-                        save_track_eq_to_db(last_track_id, prev_track_name, prev_artist_name, prev_album_name, current_gains, current_mix)
-                    last_track_id = None
+                _autosave_previous_track(last_track_id)
+                last_track_id = None
 
                 with state_lock:
-                    app_state["current_track"] = {
-                        "track_id": "",
-                        "track_name": "Playback Not Supported",
-                        "artist_name": "Local files, podcasts, or ads cannot be auto-mixed.",
-                        "album_name": "",
-                        "album_art": "",
-                        "genres": [],
-                        "tags": [],
-                        "weights": {},
-                        "mixing_reason": "The playing item is not in Spotify's online catalog or lacks standard metadata (e.g. downloaded local MP3s, advertisements, or podcasts). Play a streamed song.",
-                        "is_playing": False,
-                        "is_private_session": False
-                    }
+                    _set_idle_track_locked(idle_track(
+                        "Playback Not Supported",
+                        "Local files, podcasts, or ads cannot be auto-mixed.",
+                        "The playing item is not in Spotify's online catalog or lacks "
+                        "standard metadata (e.g. downloaded local MP3s, advertisements, "
+                        "or podcasts). Play a streamed song, or search it by name below.",
+                    ))
+                    _refresh_pipeline_locked(auth_ok=True, track_info=track_info)
                 if log_throttled:
-                    logger.info("[Spotify Monitor] Playback detected but item metadata is untrackable (e.g. local files, podcasts, ads).")
+                    logger.info("[Monitor] Playback detected but item metadata is untrackable (e.g. local files, podcasts, ads).")
                     last_status_log_time = now
                 time.sleep(1.5)
                 continue
@@ -663,30 +1049,18 @@ def monitor_spotify_playback():
                     prev_playing = app_state["current_track"].get("is_playing", False)
                     if prev_playing != is_playing:
                         app_state["current_track"]["is_playing"] = is_playing
-                        logger.info(f"[Spotify Monitor] (Manual Mode) Playback state changed: {'Playing' if is_playing else 'Paused'} for '{track_name}'")
+                        logger.info(f"[Monitor] (Manual Mode) Playback state changed: {'Playing' if is_playing else 'Paused'} for '{track_name}'")
                         last_status_log_time = now
                 time.sleep(1.5)
                 continue
 
             # If track changed, recalculate
             if track_id != last_track_id:
-                # 1. Trigger auto-save of previous track's EQ mix to recallable database!
-                if last_track_id:
-                    with state_lock:
-                        prev_track_name = app_state["current_track"].get("track_name")
-                        prev_artist_name = app_state["current_track"].get("artist_name")
-                        prev_album_name = app_state["current_track"].get("album_name")
-                        current_gains = app_state["eq"].copy()
-                        current_mix = app_state["mix"].copy()
-                    
-                    if prev_track_name and prev_track_name not in [
-                        "No Track Playing", "Spotify Player Paused", "Spotify Account Not Connected", 
-                        "🔒 Spotify Private Session Active", "No Active Spotify Playback", 
-                        "Playback Not Supported", "Spotify Account Disconnected"
-                    ]:
-                        save_track_eq_to_db(last_track_id, prev_track_name, prev_artist_name, prev_album_name, current_gains, current_mix)
+                # 1. Save the previous track's mix, but only if the listener
+                #    actually shaped it; see _autosave_previous_track.
+                _autosave_previous_track(last_track_id)
 
-                logger.info(f"[Spotify Monitor] Active song detected: '{track_name}' by {artist_name} (Playing: {is_playing})")
+                logger.info(f"[Monitor] Active song detected: '{track_name}' by {artist_name} (Playing: {is_playing})")
                 last_status_log_time = now  # Reset throttled log timer on track change
                 
                 # Automatically reset to AUTO mode on track change to enable seamless transition!
@@ -700,6 +1074,7 @@ def monitor_spotify_playback():
                 genres = []
                 tags = []
                 weights = {}
+                fallback_note = ""
                 dyn_mix = {
                     "preamp_gain": 0.0,
                     "strength": 1.0,
@@ -707,9 +1082,9 @@ def monitor_spotify_playback():
                     "vocal_clarity": 0.0,
                     "airiness": 0.0
                 }
-                
+
                 if recalled:
-                    logger.info(f"[Spotify Monitor] ✓ Recalled custom EQ profile from songs database for track {track_id}!")
+                    logger.info(f"[Monitor] OK: Recalled custom EQ profile from songs database for track {track_id}!")
                     eq_curve = {
                         "low_shelf_gain": recalled["eq"]["low_shelf_gain"], "low_shelf_freq": 120.0,
                         "first_band_gain": recalled["eq"]["first_band_gain"], "first_band_freq": 250.0, "first_band_q": 0.71,
@@ -721,14 +1096,7 @@ def monitor_spotify_playback():
                     mixing_reason = "Recalled custom EQ profile & Mastering Overlays from local songs database."
                     
                     # Fetch basic metadata for UI display
-                    if spotify_client:
-                        try:
-                            track_data = spotify_client.get_track(track_id)
-                            artist_id = track_data['artists'][0]['id']
-                            artist_data = spotify_client.get_artist(artist_id)
-                            genres = artist_data.get('genres', [])
-                        except Exception:
-                            pass
+                    genres = fetch_artist_genres(track_id, track_name, artist_name)
                     if lastfm:
                         try:
                             tags = lastfm.get_track_tags(artist_name, track_name)
@@ -736,15 +1104,8 @@ def monitor_spotify_playback():
                             pass
                 else:
                     # No recalled profile: do normal tag similarity matching!
-                    if spotify_client:
-                        try:
-                            track_data = spotify_client.get_track(track_id)
-                            artist_id = track_data['artists'][0]['id']
-                            artist_data = spotify_client.get_artist(artist_id)
-                            genres = artist_data.get('genres', [])
-                        except Exception as e:
-                            logger.warning(f"Failed to fetch artist genres: {e}")
-                    
+                    genres = fetch_artist_genres(track_id, track_name, artist_name)
+
                     if lastfm:
                         try:
                             tags = lastfm.get_track_tags(artist_name, track_name)
@@ -771,60 +1132,27 @@ def monitor_spotify_playback():
                             eq_curve["second_band_gain"] = ai_mix["second_band_gain"]
                             eq_curve["third_band_gain"] = ai_mix["third_band_gain"]
                             eq_curve["high_shelf_gain"] = ai_mix["high_shelf_gain"]
+                            eq_curve.update(LLM_BAND_FREQS)
                             mixing_reason = ai_mix["mixing_reason"]
                         except Exception as e:
                             logger.warning(f"AI Mixing Assistant failed. Toggling self-healing fallback to Similarity centroids: {e}")
+                            fallback_note = llm_fallback_note(e)
                             current_engine = "similarity" # Force similarity fallback
                             with state_lock:
                                 app_state["ai_engine"] = "similarity"
-                    
+
                     # --- STRATEGY 2: OFFLINE VECTOR MATCHING ---
                     if current_engine == "similarity":
                         weights = predictor.calculate_similarity_weights(combined_tags)
                         interpolated = predictor.synthesize_eq_curve(weights)
-                        
+
                         # Blend similarity centroid curve with target sound style offset
-                        offsets = STYLE_OFFSETS.get(sound_style, STYLE_OFFSETS["balanced"])
-                        eq_curve["low_shelf_gain"] = interpolated["low_shelf_gain"] + offsets["low_shelf_gain"]
-                        eq_curve["first_band_gain"] = interpolated["first_band_gain"] + offsets["first_band_gain"]
-                        eq_curve["second_band_gain"] = interpolated["second_band_gain"] + offsets["second_band_gain"]
-                        eq_curve["third_band_gain"] = interpolated["third_band_gain"] + offsets["third_band_gain"]
-                        eq_curve["high_shelf_gain"] = interpolated["high_shelf_gain"] + offsets["high_shelf_gain"]
-                        
+                        eq_curve = blend_curve(interpolated, sound_style)
+
                         # Generate technically explained centroids list
-                        active_w = [f"{p} ({w*100:.0f}%)" for p, w in weights.items() if w > 0]
-                        style_desc = sound_style.replace("_", " ").title()
-                        mixing_reason = f"Synthesized curves blended using preprocessed SAFE centroids ({', '.join(active_w)}) and styled as '{style_desc}'."
+                        mixing_reason = fallback_note + describe_mix(weights, sound_style)
                         
-                        # Calculate smart dynamic Advanced Mastering Overlays based on tag weights!
-                        punchy_w = weights.get("punchy", 0.0)
-                        presence_w = weights.get("presence", 0.0)
-                        airy_w = weights.get("airy", 0.0)
-                        warm_w = weights.get("warm", 0.0)
-                        bright_w = weights.get("bright", 0.0)
-                        muddy_w = weights.get("muddy", 0.0)
-                        
-                        # Smart blending logic
-                        bass_boost = round((punchy_w * 4.0) + (warm_w * 1.5) - (bright_w * 1.0), 1)
-                        bass_boost = max(0.0, min(8.0, bass_boost))
-                        
-                        vocal_clarity = round((presence_w * 3.0) + (warm_w * 1.0), 1)
-                        vocal_clarity = max(0.0, min(6.0, vocal_clarity))
-                        
-                        airiness = round((airy_w * 3.0) + (bright_w * 1.5) - (muddy_w * 1.5), 1)
-                        airiness = max(0.0, min(6.0, airiness))
-                        
-                        # Dynamically compute safe preamp headroom to prevent digital clipping!
-                        max_boost = max(bass_boost, vocal_clarity, airiness)
-                        preamp_gain = round(-0.8 * max_boost, 2)
-                        
-                        dyn_mix = {
-                            "preamp_gain": preamp_gain,
-                            "strength": 1.0,
-                            "bass_boost": bass_boost,
-                            "vocal_clarity": vocal_clarity,
-                            "airiness": airiness
-                        }
+                        dyn_mix = dynamic_overlays(weights)
                 
                 # Update status variables safely
                 with state_lock:
@@ -837,22 +1165,22 @@ def monitor_spotify_playback():
                         "genres": genres,
                         "tags": tags,
                         "weights": weights,
+                        # Whichever source actually identified it, so the UI can
+                        # say so rather than always crediting Spotify.
+                        "source": track_info.get("source", "spotify"),
+                        "placeholder": False,
                         "mixing_reason": mixing_reason,
                         "is_playing": is_playing,
                         "is_private_session": False
                     }
-                    app_state["eq"]["low_shelf_gain"] = eq_curve["low_shelf_gain"]
-                    app_state["eq"]["first_band_gain"] = eq_curve["first_band_gain"]
-                    app_state["eq"]["second_band_gain"] = eq_curve["second_band_gain"]
-                    app_state["eq"]["third_band_gain"] = eq_curve["third_band_gain"]
-                    app_state["eq"]["high_shelf_gain"] = eq_curve["high_shelf_gain"]
+                    _set_eq_locked(eq_curve)
                     
                     # Persist dynamic overlays in Auto mode
                     if app_state["mode"] == "auto":
                         app_state["mix"] = dyn_mix
                     
                 # Write to active APO filters
-                apply_and_write_apo()
+                commit_state()
                 last_track_id = track_id
             else:
                 # Track has not changed, but play/pause state may have changed
@@ -860,39 +1188,12 @@ def monitor_spotify_playback():
                     prev_playing = app_state["current_track"].get("is_playing", False)
                     if prev_playing != is_playing:
                         app_state["current_track"]["is_playing"] = is_playing
-                        logger.info(f"[Spotify Monitor] Playback state changed: {'Playing' if is_playing else 'Paused'} for '{track_name}'")
+                        logger.info(f"[Monitor] Playback state changed: {'Playing' if is_playing else 'Paused'} for '{track_name}'")
                         last_status_log_time = now
             
-            # Dynamically compute and store the live pipeline status on every iteration!
             with state_lock:
-                app_state["pipeline_status"]["spotify"] = "Connected (OAuth active)" if auth_ok else "Disconnected"
-                
-                if not auth_ok:
-                    app_state["pipeline_status"]["playback"] = "Waiting for Spotify connection..."
-                elif not track_info:
-                    app_state["pipeline_status"]["playback"] = "Waiting for stream in Spotify app..."
-                elif track_info.get("is_private_session"):
-                    app_state["pipeline_status"]["playback"] = "🔒 Blocked (Private Session Active)"
-                elif not track_id or not track_name or track_name == "Unknown":
-                    app_state["pipeline_status"]["playback"] = "Unsupported content (Local/Ad/Podcast)"
-                else:
-                    app_state["pipeline_status"]["playback"] = f"Active: '{track_name}'"
-                
-                if not auth_ok or not track_info or track_info.get("is_private_session") or not track_id:
-                    app_state["pipeline_status"]["dsp_engine"] = "Idle (Waiting for metadata)"
-                elif app_state["ai_engine"] == "similarity":
-                    app_state["pipeline_status"]["dsp_engine"] = "📊 Vector Similarity Centroids"
-                else:
-                    app_state["pipeline_status"]["dsp_engine"] = "🤖 AI Mixing Assistant"
-                
-                write_st = app_state["apo_write_status"]
-                if write_st == "success":
-                    app_state["pipeline_status"]["apo_writer"] = "✓ Hardware EQ Active (config.txt updated)"
-                elif write_st == "permission_denied":
-                    app_state["pipeline_status"]["apo_writer"] = "❌ Write Permission Error (Run as Admin)"
-                else:
-                    app_state["pipeline_status"]["apo_writer"] = "⚠ Equalizer APO Not Found (Bypassed)"
-                
+                _refresh_pipeline_locked(auth_ok=True, track_info=track_info)
+
         except Exception as e:
             logger.error(f"Error in direct user monitor loop: {e}", exc_info=True)
             
@@ -908,14 +1209,26 @@ def home():
     return render_template('index.html')
 
 
+@app.route('/favicon.ico')
+def favicon():
+    """Browsers ask for this at the root regardless of the <link> tag, and a
+    404 on every page load is noise in a log people are told to read."""
+    return app.send_static_file('favicon.ico')
+
+
 @app.route('/api/status', methods=['GET'])
 def get_status():
     with state_lock:
         return jsonify(app_state)
 
 
-def recalculate_current_track_eq():
-    """Recomputes EQ parameters for the currently active track based on the selected engine and style."""
+def recalculate_current_track_eq(force_recompute: bool = False):
+    """Recompute the EQ for the active track from the selected engine and style.
+
+    force_recompute skips the saved-profile recall. Changing the style or the
+    engine is an explicit instruction, so it has to win over a stored curve;
+    otherwise those controls appear broken on any track with a saved profile.
+    """
     global app_state, predictor, lastfm, spotify_client
     
     with state_lock:
@@ -928,11 +1241,11 @@ def recalculate_current_track_eq():
     genres = track.get("genres", [])
     tags = track.get("tags", [])
     track_id = track.get("track_id", "")
-    
-    # Skip if no real song is playing
-    if not track_name or track_name in ["No Track Playing", "Spotify Player Paused", "Spotify Account Not Connected", "Spotify is not connected", "Stream music on your Spotify app to auto-mix.", "Please click Connect Spotify above to authorize."]:
+
+    # Skip if no real song is loaded
+    if _is_placeholder(track):
         return
-        
+
     combined_tags = tags + genres
     
     eq_curve = {
@@ -941,6 +1254,7 @@ def recalculate_current_track_eq():
     }
     mixing_reason = ""
     weights = {}
+    fallback_note = ""
     dyn_mix = {
         "preamp_gain": 0.0,
         "strength": 1.0,
@@ -948,14 +1262,14 @@ def recalculate_current_track_eq():
         "vocal_clarity": 0.0,
         "airiness": 0.0
     }
-    
+
     # Try to recall existing custom EQ mix from songs database first!
     recalled = None
-    if track_id:
+    if track_id and not force_recompute:
         recalled = load_track_eq_from_db(track_id)
         
     if recalled:
-        logger.info(f"Recalculate: ✓ Recalled custom EQ profile from database for track {track_id}!")
+        logger.info(f"Recalculate: OK: Recalled custom EQ profile from database for track {track_id}!")
         eq_curve = {
             "low_shelf_gain": recalled["eq"]["low_shelf_gain"],
             "first_band_gain": recalled["eq"]["first_band_gain"],
@@ -975,66 +1289,29 @@ def recalculate_current_track_eq():
                 eq_curve["second_band_gain"] = ai_mix["second_band_gain"]
                 eq_curve["third_band_gain"] = ai_mix["third_band_gain"]
                 eq_curve["high_shelf_gain"] = ai_mix["high_shelf_gain"]
+                eq_curve.update(LLM_BAND_FREQS)
                 mixing_reason = ai_mix["mixing_reason"]
             except Exception as e:
                 logger.warning(f"AI Mixing Assistant failed during recalculation, falling back to similarity: {e}")
+                fallback_note = llm_fallback_note(e)
                 current_engine = "similarity"
                 with state_lock:
                     app_state["ai_engine"] = "similarity"
-                
+
         if current_engine == "similarity":
             weights = predictor.calculate_similarity_weights(combined_tags)
             interpolated = predictor.synthesize_eq_curve(weights)
+
+            eq_curve = blend_curve(interpolated, sound_style)
+
+            mixing_reason = fallback_note + describe_mix(weights, sound_style)
             
-            offsets = STYLE_OFFSETS.get(sound_style, STYLE_OFFSETS["balanced"])
-            eq_curve["low_shelf_gain"] = interpolated["low_shelf_gain"] + offsets["low_shelf_gain"]
-            eq_curve["first_band_gain"] = interpolated["first_band_gain"] + offsets["first_band_gain"]
-            eq_curve["second_band_gain"] = interpolated["second_band_gain"] + offsets["second_band_gain"]
-            eq_curve["third_band_gain"] = interpolated["third_band_gain"] + offsets["third_band_gain"]
-            eq_curve["high_shelf_gain"] = interpolated["high_shelf_gain"] + offsets["high_shelf_gain"]
-            
-            active_w = [f"{p} ({w*100:.0f}%)" for p, w in weights.items() if w > 0]
-            style_desc = sound_style.replace("_", " ").title()
-            mixing_reason = f"Synthesized curves blended using preprocessed SAFE centroids ({', '.join(active_w)}) and styled as '{style_desc}'."
-            
-            # Calculate smart dynamic Advanced Mastering Overlays based on tag weights!
-            punchy_w = weights.get("punchy", 0.0)
-            presence_w = weights.get("presence", 0.0)
-            airy_w = weights.get("airy", 0.0)
-            warm_w = weights.get("warm", 0.0)
-            bright_w = weights.get("bright", 0.0)
-            muddy_w = weights.get("muddy", 0.0)
-            
-            # Smart blending logic
-            bass_boost = round((punchy_w * 4.0) + (warm_w * 1.5) - (bright_w * 1.0), 1)
-            bass_boost = max(0.0, min(8.0, bass_boost))
-            
-            vocal_clarity = round((presence_w * 3.0) + (warm_w * 1.0), 1)
-            vocal_clarity = max(0.0, min(6.0, vocal_clarity))
-            
-            airiness = round((airy_w * 3.0) + (bright_w * 1.5) - (muddy_w * 1.5), 1)
-            airiness = max(0.0, min(6.0, airiness))
-            
-            # Dynamically compute safe preamp headroom to prevent digital clipping!
-            max_boost = max(bass_boost, vocal_clarity, airiness)
-            preamp_gain = round(-0.8 * max_boost, 2)
-            
-            dyn_mix = {
-                "preamp_gain": preamp_gain,
-                "strength": 1.0,
-                "bass_boost": bass_boost,
-                "vocal_clarity": vocal_clarity,
-                "airiness": airiness
-            }
+            dyn_mix = dynamic_overlays(weights)
         
     with state_lock:
         app_state["current_track"]["weights"] = weights if current_engine == "similarity" else {}
         app_state["current_track"]["mixing_reason"] = mixing_reason
-        app_state["eq"]["low_shelf_gain"] = eq_curve["low_shelf_gain"]
-        app_state["eq"]["first_band_gain"] = eq_curve["first_band_gain"]
-        app_state["eq"]["second_band_gain"] = eq_curve["second_band_gain"]
-        app_state["eq"]["third_band_gain"] = eq_curve["third_band_gain"]
-        app_state["eq"]["high_shelf_gain"] = eq_curve["high_shelf_gain"]
+        _set_eq_locked(eq_curve)
         
         # Persist dynamic overlays in Auto mode
         if app_state["mode"] == "auto":
@@ -1048,14 +1325,18 @@ def set_engine():
     new_engine = data.get("engine")
     if new_engine not in ["llm", "similarity"]:
         return jsonify({"success": False, "message": "Invalid engine."}), 400
-        
+    if new_engine == "llm" and not llm_available():
+        return jsonify({"success": False,
+                        "message": "No LLM provider is configured. Keyword profile "
+                                   "matching is the engine."}), 400
+
     with state_lock:
         app_state["ai_engine"] = new_engine
         logger.info(f"AI Mixing Engine set to: {new_engine}")
-        
-    # Recompute immediately
-    recalculate_current_track_eq()
-    apply_and_write_apo()
+
+    # Recompute immediately, overriding any saved profile for this track.
+    recalculate_current_track_eq(force_recompute=True)
+    commit_state()
     return jsonify({"success": True, "engine": new_engine})
 
 
@@ -1070,10 +1351,10 @@ def set_sound_style():
     with state_lock:
         app_state["sound_style"] = new_style
         logger.info(f"Target Sound Style set to: {new_style}")
-        
-    # Recalculate immediately with new style
-    recalculate_current_track_eq()
-    apply_and_write_apo()
+
+    # Recalculate immediately, overriding any saved profile for this track.
+    recalculate_current_track_eq(force_recompute=True)
+    commit_state()
     return jsonify({"success": True, "style": new_style, "state": app_state})
 
 
@@ -1090,32 +1371,226 @@ def set_mode():
         
     if new_mode == "auto":
         recalculate_current_track_eq()
-        apply_and_write_apo()
+        commit_state()
         
     return jsonify({"success": True, "mode": new_mode})
+
+
+# Accepted range per field. Anything outside is a client bug or an attack, not
+# something to silently clamp into a shape we then apply to the user's audio.
+EQ_FIELD_LIMITS = {
+    "low_shelf_gain": (-15.0, 15.0), "low_shelf_freq": (20.0, 500.0),
+    "first_band_gain": (-15.0, 15.0), "first_band_freq": (20.0, 20000.0),
+    "first_band_q": (0.1, 10.0),
+    "second_band_gain": (-15.0, 15.0), "second_band_freq": (20.0, 20000.0),
+    "second_band_q": (0.1, 10.0),
+    "third_band_gain": (-15.0, 15.0), "third_band_freq": (20.0, 20000.0),
+    "third_band_q": (0.1, 10.0),
+    "high_shelf_gain": (-15.0, 15.0), "high_shelf_freq": (1000.0, 20000.0),
+}
+MIX_FIELD_LIMITS = {
+    "preamp_gain": (-12.0, 0.0), "strength": (0.0, 2.0),
+    "bass_boost": (-8.0, 8.0), "vocal_clarity": (-6.0, 6.0),
+    "airiness": (-6.0, 6.0),
+}
+
+
+def _coerce_field(name: str, raw, limits: dict):
+    """Parse one numeric field, or raise ValueError with a usable message.
+
+    float("nan") passes silently through min()/max() in CPython (min(15.0, nan)
+    returns 15.0), so posting a NaN gain used to yield a +15 dB band. Non-finite
+    values are rejected outright rather than clamped.
+    """
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number, got {raw!r}")
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite, got {raw!r}")
+    lo, hi = limits[name]
+    if not (lo <= value <= hi):
+        raise ValueError(f"{name} must be within [{lo}, {hi}], got {value}")
+    return value
 
 
 @app.route('/api/update_eq', methods=['POST'])
 def update_eq_parameters():
     data = request.json or {}
-    
+
+    try:
+        new_eq = {
+            k: _coerce_field(k, data["eq"][k], EQ_FIELD_LIMITS)
+            for k in app_state["eq"] if k in data.get("eq", {})
+        }
+        new_mix = {
+            k: _coerce_field(k, data["mix"][k], MIX_FIELD_LIMITS)
+            for k in app_state["mix"] if k in data.get("mix", {})
+        }
+    except ValueError as e:
+        return jsonify({"success": False, "message": str(e)}), 400
+
     with state_lock:
         if app_state["mode"] == "auto":
             app_state["mode"] = "manual"
             logger.info("Manual drag detected: Toggled into manual override mode.")
-            
-        if "eq" in data:
-            for k in app_state["eq"]:
-                if k in data["eq"]:
-                    app_state["eq"][k] = float(data["eq"][k])
-                    
-        if "mix" in data:
-            for k in app_state["mix"]:
-                if k in data["mix"]:
-                    app_state["mix"][k] = float(data["mix"][k])
-                    
-    apply_and_write_apo()
-    return jsonify({"success": True, "state": app_state})
+        app_state["eq"].update(new_eq)
+        app_state["mix"].update(new_mix)
+
+    mark_user_edit()
+    commit_state()
+    with state_lock:
+        return jsonify({"success": True, "state": app_state})
+
+
+@app.route('/api/bypass', methods=['POST'])
+def set_bypass():
+    """Hold-to-compare: swap between the processed curve and flat.
+
+    The two arms are level-matched so the comparison is about tone rather than
+    about which side happens to be louder. The match is analytic (pink-weighted
+    over an assumed spectrum), which is why the UI labels it "assumed"; a real
+    measured match needs the loopback capture that lands in the next phase.
+    """
+    data = request.json or {}
+    enabled = bool(data.get("enabled", False))
+    with state_lock:
+        app_state["bypass"] = enabled
+    commit_state()
+    with state_lock:
+        return jsonify({
+            "success": True,
+            "bypass": enabled,
+            "level_match": "assumed",
+            "output": app_state["output"],
+        })
+
+
+@app.route('/api/feedback', methods=['POST'])
+def record_feedback():
+    """Record a thumbs-up / thumbs-down against the mix currently playing.
+
+    This is capture only. There is no model consuming it yet; the point is that
+    votes are worth nothing retroactively, so collection starts the moment the
+    button exists. Each vote is stored with the exact curve that was audible,
+    projected into the 4-axis preference basis, so it stays usable when the
+    model lands.
+    """
+    if preferences is None:
+        return jsonify({"success": False,
+                        "message": "Preference store unavailable."}), 503
+
+    data = request.json or {}
+    verdict = str(data.get("verdict", "")).lower()
+    if verdict not in ("up", "down"):
+        return jsonify({"success": False,
+                        "message": "verdict must be 'up' or 'down'."}), 400
+
+    with state_lock:
+        track = app_state["current_track"].copy()
+        eq = app_state["eq"].copy()
+        output = app_state["output"].copy()
+        style = app_state["sound_style"]
+        engine = app_state["ai_engine"]
+        bypassed = app_state["bypass"]
+
+    # A vote cast while the EQ is bypassed is a vote about no EQ at all.
+    if bypassed:
+        return jsonify({"success": False,
+                        "message": "Release Compare before rating the mix."}), 409
+
+    # The placeholder headlines are truthy strings, so a plain emptiness check
+    # let a vote through with nothing playing.
+    if _is_placeholder(track):
+        return jsonify({"success": False,
+                        "message": "Nothing is loaded to rate."}), 409
+
+    try:
+        result = preferences.record_unary(
+            verdict=verdict,
+            eq=eq,
+            preamp_db=float(output.get("preamp_db", 0.0)),
+            track=track,
+            sound_style=style,
+            engine=engine,
+            limited=bool(output.get("limited")),
+        )
+    except Exception as e:
+        logger.error(f"Failed to record preference: {e}")
+        return jsonify({"success": False, "message": "Could not record vote."}), 500
+
+    return jsonify({"success": True, **result, "summary": preferences.summary()})
+
+
+@app.route('/api/feedback/summary', methods=['GET'])
+def feedback_summary():
+    if preferences is None:
+        return jsonify({"total": 0, "up": 0, "down": 0})
+    return jsonify(preferences.summary())
+
+
+@app.route('/api/art/<key>', methods=['GET'])
+def get_album_art(key):
+    """Serve cover art captured from the Windows media session.
+
+    SMTC hands over an image stream rather than a URL, so unlike the Spotify
+    path there is nothing the browser can fetch directly. The reader caches the
+    bytes when a track starts and this hands them out. Immutable because the
+    key is a hash of artist and title: a given key's art never changes.
+    """
+    if smtc_source is None:
+        return ("", 404)
+
+    # Path traversal is not possible through Flask's <key> converter, but the
+    # key is used as a cache lookup, so keep it to the shape we generate.
+    if not re.fullmatch(r"[0-9a-f]{16}", key or ""):
+        return ("", 400)
+
+    data, content_type = smtc_source.get_art(key)
+    if not data:
+        return ("", 404)
+
+    response = app.response_class(data, mimetype=content_type or "image/png")
+    response.headers["Cache-Control"] = "public, max-age=86400, immutable"
+    response.headers["Content-Length"] = str(len(data))
+    return response
+
+
+@app.route('/api/quit', methods=['POST'])
+def quit_app():
+    """Stop the server and hand the audio device back flat.
+
+    Launched from the taskbar there is no console to close and no tray icon,
+    so without this the process ran forever with the last curve still applied
+    to every sound on the machine, and the only way out was Task Manager,
+    which is a hard kill and therefore leaves the EQ applied.
+
+    shutdown() writes flat synchronously before the process ends, so the exit
+    is clean in the sense that matters: the listener's audio is unprocessed
+    again the moment this returns.
+    """
+    def stop():
+        # Let the response reach the browser first, so the page can say what
+        # happened rather than dying mid-request.
+        time.sleep(0.4)
+        shutdown("dashboard quit")
+        # Werkzeug removed the in-request shutdown hook in 2.1, and the flat
+        # write has already happened, so exiting outright is both sufficient
+        # and the only option that does not depend on the server internals.
+        os._exit(0)
+
+    threading.Thread(target=stop, daemon=True).start()
+    return jsonify({"success": True,
+                    "message": "Sonic Vector is stopping. Your EQ has been reset to flat."})
+
+
+@app.route('/api/apo/status', methods=['GET'])
+def get_apo_status():
+    """Re-probe whether Equalizer APO is on the output the user is using."""
+    status = apo.probe_apo_status()
+    with state_lock:
+        app_state["apo_status"] = status
+    return jsonify(status)
 
 
 @app.route('/api/eq/reset', methods=['POST'])
@@ -1138,7 +1613,7 @@ def reset_eq():
             "airiness": 0.0
         }
         
-    apply_and_write_apo()
+    commit_state()
     return jsonify({"success": True})
 
 
@@ -1158,72 +1633,34 @@ def redo_eq_mix():
     tags = track.get("tags", [])
     
     # Check if a valid track is loaded
-    if not track_name or track_name in ["No Track Playing", "Spotify Account Disconnected", "Spotify is not connected", "Please click Connect Spotify above to authorize."]:
-        return jsonify({"success": False, "message": "No active track to remix."}), 400
-        
+    if _is_placeholder(track):
+        return jsonify({"success": False,
+                        "message": "Nothing loaded to remix. Search a track first."}), 400
+
     combined_tags = tags + genres
     
     # 1. Similarity weights calculation with 35% semantic divergence!
     divergence = 0.35
     weights = predictor.calculate_similarity_weights(combined_tags, divergence=divergence)
-    eq_curve = predictor.synthesize_eq_curve(weights)
-    
+    interpolated = predictor.synthesize_eq_curve(weights)
+
     # 2. Add target sound style offsets
-    offsets = STYLE_OFFSETS.get(sound_style, STYLE_OFFSETS["balanced"])
-    eq_curve["low_shelf_gain"] = eq_curve["low_shelf_gain"] + offsets["low_shelf_gain"]
-    eq_curve["first_band_gain"] = eq_curve["first_band_gain"] + offsets["first_band_gain"]
-    eq_curve["second_band_gain"] = eq_curve["second_band_gain"] + offsets["second_band_gain"]
-    eq_curve["third_band_gain"] = eq_curve["third_band_gain"] + offsets["third_band_gain"]
-    eq_curve["high_shelf_gain"] = eq_curve["high_shelf_gain"] + offsets["high_shelf_gain"]
-            
-    style_desc = sound_style.replace("_", " ").title()
-    active_w = [f"{p} ({w*100:.0f}%)" for p, w in weights.items() if w > 0]
-    
-    mixing_reason = f"Remixed EQ using preprocessed SAFE centroids with 35% semantic divergence ({', '.join(active_w)}) and styled as '{style_desc}'."
-    
-    # Calculate smart dynamic Advanced Mastering Overlays based on tag weights!
-    punchy_w = weights.get("punchy", 0.0)
-    presence_w = weights.get("presence", 0.0)
-    airy_w = weights.get("airy", 0.0)
-    warm_w = weights.get("warm", 0.0)
-    bright_w = weights.get("bright", 0.0)
-    muddy_w = weights.get("muddy", 0.0)
-    
-    # Smart blending logic
-    bass_boost = round((punchy_w * 4.0) + (warm_w * 1.5) - (bright_w * 1.0), 1)
-    bass_boost = max(0.0, min(8.0, bass_boost))
-    
-    vocal_clarity = round((presence_w * 3.0) + (warm_w * 1.0), 1)
-    vocal_clarity = max(0.0, min(6.0, vocal_clarity))
-    
-    airiness = round((airy_w * 3.0) + (bright_w * 1.5) - (muddy_w * 1.5), 1)
-    airiness = max(0.0, min(6.0, airiness))
-    
-    # Dynamically compute safe preamp headroom to prevent digital clipping!
-    max_boost = max(bass_boost, vocal_clarity, airiness)
-    preamp_gain = round(-0.8 * max_boost, 2)
-    
-    dyn_mix = {
-        "preamp_gain": preamp_gain,
-        "strength": 1.0,
-        "bass_boost": bass_boost,
-        "vocal_clarity": vocal_clarity,
-        "airiness": airiness
-    }
+    eq_curve = blend_curve(interpolated, sound_style)
+
+    mixing_reason = describe_mix(weights, sound_style, verb="Remixed")
+
+
+    dyn_mix = dynamic_overlays(weights)
     
     # Apply and save to state
     with state_lock:
         app_state["mode"] = "auto"  # Force auto mode so that overlays are active and it syncs nicely!
         app_state["current_track"]["weights"] = weights
         app_state["current_track"]["mixing_reason"] = mixing_reason
-        app_state["eq"]["low_shelf_gain"] = eq_curve["low_shelf_gain"]
-        app_state["eq"]["first_band_gain"] = eq_curve["first_band_gain"]
-        app_state["eq"]["second_band_gain"] = eq_curve["second_band_gain"]
-        app_state["eq"]["third_band_gain"] = eq_curve["third_band_gain"]
-        app_state["eq"]["high_shelf_gain"] = eq_curve["high_shelf_gain"]
+        _set_eq_locked(eq_curve)
         app_state["mix"] = dyn_mix
             
-    apply_and_write_apo()
+    commit_state()
     return jsonify({"success": True, "state": app_state})
 
 
@@ -1236,13 +1673,165 @@ def get_spotify_status():
             auth_ok = spotify_oauth.is_authenticated()
         except Exception:
             pass
-    return jsonify({"authenticated": auth_ok})
+    with authenticating_lock:
+        in_progress = is_authenticating
+    return jsonify({
+        "authenticated": auth_ok,
+        "in_progress": in_progress,
+        # Why the last attempt failed. The Connect button used to just
+        # re-enable itself after eight seconds and say nothing at all.
+        "last_error": getattr(spotify_oauth, "last_error", None) if not auth_ok else None,
+    })
+
+
+CONFIG_YAML = "config.yaml"
+DEFAULT_REDIRECT_URI = "http://127.0.0.1:8888/callback"
+
+
+def _mask_secret(value: str) -> str:
+    """Show enough of a credential to recognise it, not enough to reuse it."""
+    text = str(value or "")
+    if len(text) <= 8:
+        return "*" * len(text)
+    return f"{text[:4]}{'*' * (len(text) - 8)}{text[-4:]}"
+
+
+@app.route('/api/spotify/config', methods=['GET'])
+def get_spotify_config():
+    """What the dashboard needs to render the setup panel.
+
+    The secret is never sent back, masked or otherwise: the panel only needs to
+    know whether one is stored.
+    """
+    with state_lock:
+        configured = app_state["spotify_configured"]
+        redirect_uri = app_state["spotify_redirect_uri"]
+    return jsonify({
+        "configured": configured,
+        "client_id": _mask_secret(os.environ.get("SPOTIFY_CLIENT_ID", "")) if configured else "",
+        "redirect_uri": redirect_uri,
+        "default_redirect_uri": DEFAULT_REDIRECT_URI,
+        "dashboard_url": "https://developer.spotify.com/dashboard",
+    })
+
+
+@app.route('/api/spotify/config', methods=['POST'])
+def set_spotify_config():
+    """Store Spotify API credentials and bring the integration up live.
+
+    Editing config.yaml by hand and restarting was the only way to turn Spotify
+    on, which is a poor answer to "how do I enable this". The credentials are
+    verified against Spotify's token endpoint before anything is written, so a
+    typo is reported here rather than surfacing later as a silent no-op.
+    """
+    global spotify_client, spotify_oauth
+
+    data = request.json or {}
+    client_id = str(data.get("client_id", "")).strip()
+    client_secret = str(data.get("client_secret", "")).strip()
+    redirect_uri = str(data.get("redirect_uri", "")).strip() or DEFAULT_REDIRECT_URI
+
+    if not client_id or not client_secret:
+        return jsonify({"success": False,
+                        "message": "Both the Client ID and the Client Secret are required."}), 400
+    if is_placeholder(client_id) or is_placeholder(client_secret):
+        return jsonify({"success": False,
+                        "message": "Those are the example placeholder values, not real credentials."}), 400
+    # Spotify's rules since 2025-04-09: HTTPS everywhere, except loopback, where
+    # HTTP is allowed but only as an explicit IP literal. "localhost" is
+    # specifically rejected by Spotify, so accepting it here would just move the
+    # failure to the authorize call, where it reads as INVALID_CLIENT and is
+    # much harder to diagnose.
+    # https://developer.spotify.com/documentation/web-api/concepts/redirect_uri
+    if redirect_uri.startswith(("http://localhost", "https://localhost")):
+        return jsonify({"success": False,
+                        "message": "Spotify does not accept 'localhost' in a redirect URI. "
+                                   "Use http://127.0.0.1:8888/callback instead, and set the "
+                                   "same value in your Spotify app's settings."}), 400
+    if not redirect_uri.startswith(("http://127.0.0.1", "http://[::1]", "https://")):
+        return jsonify({"success": False,
+                        "message": "The redirect URI must be an explicit loopback address "
+                                   "(http://127.0.0.1:PORT/... or http://[::1]:PORT/...) "
+                                   "or an https:// URL."}), 400
+
+    # Verify before persisting. Client credentials is the cheapest call that
+    # proves the pair is real, and it needs no browser round trip.
+    try:
+        auth = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+        res = requests.post(
+            "https://accounts.spotify.com/api/token",
+            headers={"Authorization": f"Basic {auth}",
+                     "Content-Type": "application/x-www-form-urlencoded"},
+            data={"grant_type": "client_credentials"},
+            timeout=10,
+        )
+    except requests.exceptions.RequestException as e:
+        return jsonify({"success": False,
+                        "message": f"Could not reach Spotify to verify the keys: {e}"}), 502
+
+    if res.status_code != 200:
+        detail = ""
+        try:
+            body = res.json()
+            detail = str(body.get("error_description") or body.get("error") or "")
+        except ValueError:
+            pass
+        message = "Spotify rejected that Client ID / Client Secret pair."
+        if detail:
+            message += f" (Spotify said: {detail})"
+        return jsonify({"success": False, "message": message}), 400
+
+    try:
+        set_section_values(PROJECT_ROOT / CONFIG_YAML, "spotify", {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": redirect_uri,
+        })
+    except Exception as e:
+        logger.error(f"Could not write Spotify credentials to config.yaml: {e}")
+        return jsonify({"success": False,
+                        "message": f"Verified, but config.yaml could not be written: {e}"}), 500
+
+    os.environ["SPOTIFY_CLIENT_ID"] = client_id
+    os.environ["SPOTIFY_CLIENT_SECRET"] = client_secret
+    os.environ["SPOTIFY_REDIRECT_URI"] = redirect_uri
+
+    try:
+        spotify_client = SpotifyAPIClient(config_path=str(PROJECT_ROOT / CONFIG_YAML))
+        spotify_oauth = SpotifyService()
+    except Exception as e:
+        logger.error(f"Spotify credentials saved but the client would not start: {e}")
+        return jsonify({"success": False,
+                        "message": f"Saved, but the Spotify client would not start: {e}"}), 500
+
+    with state_lock:
+        app_state["spotify_configured"] = True
+        app_state["spotify_redirect_uri"] = redirect_uri
+        if _is_placeholder(app_state["current_track"]):
+            _set_idle_track_locked(spotify_idle_track())
+        _refresh_pipeline_locked(auth_ok=False)
+
+    logger.info("Spotify credentials accepted and verified. Connect the account to start syncing.")
+    return jsonify({
+        "success": True,
+        "message": "Credentials verified and saved. Click CONNECT SPOTIFY to link your account.",
+        "redirect_uri": redirect_uri,
+    })
+
+
 
 
 @app.route('/api/spotify/authenticate', methods=['POST'])
 def trigger_spotify_authenticate():
     global spotify_oauth, is_authenticating
-    
+
+    # Without this the endpoint raised AttributeError on None inside a daemon
+    # thread, so the browser saw a cheerful "Authorization pop-up triggered"
+    # and nothing ever opened.
+    if spotify_oauth is None:
+        return jsonify({"success": False,
+                        "message": "Spotify is not set up yet. Add your API keys first."}), 400
+
     with authenticating_lock:
         if is_authenticating:
             return jsonify({"success": True, "message": "Authentication already in progress."})
@@ -1270,22 +1859,19 @@ def trigger_spotify_disconnect():
         try:
             logger.info("Clearing Spotify authentication tokens from memory and disk...")
             spotify_oauth.clear_tokens()
-            
+
             with state_lock:
                 app_state["spotify_authenticated"] = False
-                app_state["current_track"] = {
-                    "track_id": "",
-                    "track_name": "Spotify Account Disconnected",
-                    "artist_name": "Please click Connect Spotify above to authorize another account.",
-                    "album_name": "",
-                    "album_art": "",
-                    "genres": [],
-                    "tags": [],
-                    "weights": {},
-                    "mixing_reason": "Tokens cleared. Direct user playback sync suspended.",
-                    "is_playing": False,
-                    "is_private_session": False
-                }
+                # A track the listener searched for is theirs, not Spotify's,
+                # so unlinking the account must not take it off the screen.
+                if app_state["current_track"].get("source") != "search":
+                    app_state["current_track"] = idle_track(
+                        "Spotify Account Disconnected",
+                        "Click CONNECT SPOTIFY above to authorize another account.",
+                        "Tokens cleared. Playback sync is suspended; the search box "
+                        "and every EQ control still work.",
+                    )
+                _refresh_pipeline_locked(auth_ok=False)
             return jsonify({"success": True, "message": "Spotify credentials successfully cleared."})
         except Exception as e:
             logger.error(f"Failed to clear Spotify credentials: {e}")
@@ -1316,39 +1902,62 @@ def search_and_mix():
     album_name = ""
     genres = []
     
-    # Run query against authenticated Spotify OAuth
+    # Enrich with Spotify if it is available. Two independent routes, because
+    # neither is required: the OAuth token when an account is linked, and the
+    # client-credentials token when credentials exist but nobody has logged in.
+    # The catalogue search does not need a user, so requiring the login for it
+    # was needlessly narrowing what worked.
+    search_str = f"track:{track_query}"
+    if artist_query:
+        search_str += f" artist:{artist_query}"
+
+    track_data = None
+    headers = None
     if spotify_oauth and spotify_oauth.is_authenticated():
         try:
-            search_str = f"track:{track_query}"
-            if artist_query:
-                search_str += f" artist:{artist_query}"
-            
             headers = {"Authorization": f"Bearer {spotify_oauth.access_token}"}
             res = requests.get(
                 "https://api.spotify.com/v1/search",
                 headers=headers,
-                params={"q": search_str, "type": "track", "limit": 1}
+                params={"q": search_str, "type": "track", "limit": 1},
+                timeout=10,
             )
             if res.status_code == 200:
                 items = res.json().get("tracks", {}).get("items", [])
-                if items:
-                    track_data = items[0]
-                    track_id = track_data["id"]
-                    track_name = track_data["name"]
-                    artist_name = track_data["artists"][0]["name"]
-                    album_name = track_data["album"]["name"]
-                    images = track_data["album"]["images"]
-                    if images:
-                        album_art = images[0]["url"]
-                        
-                    # Fetch genres
-                    artist_id = track_data["artists"][0]["id"]
-                    res_artist = requests.get(f"https://api.spotify.com/v1/artists/{artist_id}", headers=headers)
-                    if res_artist.status_code == 200:
-                        genres = res_artist.json().get("genres", [])
+                track_data = items[0] if items else None
         except Exception as e:
-            logger.warning(f"Spotify search override failed: {e}")
-            
+            logger.warning(f"Spotify search (OAuth) failed: {e}")
+            headers = None
+
+    if track_data is None and spotify_client is not None:
+        try:
+            result = spotify_client.search_track(search_str) or {}
+            items = result.get("tracks", {}).get("items", [])
+            track_data = items[0] if items else None
+            if track_data is not None:
+                headers = spotify_client._get_auth_headers()
+        except Exception as e:
+            logger.warning(f"Spotify search (client credentials) failed: {e}")
+
+    if track_data is not None:
+        try:
+            track_id = track_data["id"]
+            track_name = track_data["name"]
+            artist_name = track_data["artists"][0]["name"]
+            album_name = track_data["album"]["name"]
+            images = track_data["album"]["images"]
+            if images:
+                album_art = images[0]["url"]
+
+            artist_id = track_data["artists"][0]["id"]
+            res_artist = requests.get(
+                f"https://api.spotify.com/v1/artists/{artist_id}",
+                headers=headers, timeout=10)
+            if res_artist.status_code == 200:
+                genres = res_artist.json().get("genres", [])
+        except Exception as e:
+            logger.warning(f"Could not read Spotify search result: {e}")
+
     # Fallback to Last.fm
     tags = []
     if lastfm:
@@ -1371,6 +1980,7 @@ def search_and_mix():
     }
     mixing_reason = ""
     weights = {}
+    fallback_note = ""
     dyn_mix = {
         "preamp_gain": 0.0,
         "strength": 1.0,
@@ -1378,9 +1988,9 @@ def search_and_mix():
         "vocal_clarity": 0.0,
         "airiness": 0.0
     }
-    
+
     if recalled:
-        logger.info(f"Search Recalled: ✓ Recalled custom EQ profile from database for search track {track_id}!")
+        logger.info(f"Search Recalled: OK: Recalled custom EQ profile from database for search track {track_id}!")
         eq_curve = {
             "low_shelf_gain": recalled["eq"]["low_shelf_gain"],
             "first_band_gain": recalled["eq"]["first_band_gain"],
@@ -1403,56 +2013,24 @@ def search_and_mix():
                 eq_curve["second_band_gain"] = ai_mix["second_band_gain"]
                 eq_curve["third_band_gain"] = ai_mix["third_band_gain"]
                 eq_curve["high_shelf_gain"] = ai_mix["high_shelf_gain"]
+                eq_curve.update(LLM_BAND_FREQS)
                 mixing_reason = ai_mix["mixing_reason"]
-            except Exception:
+            except Exception as e:
+                logger.warning(f"AI Mixing Assistant failed on search, falling back to similarity: {e}")
+                fallback_note = llm_fallback_note(e)
                 current_engine = "similarity"
-                
+
         if current_engine == "similarity":
             weights = predictor.calculate_similarity_weights(combined_tags)
             interpolated = predictor.synthesize_eq_curve(weights)
-            
+
             # Blend similarity centroid curve with target sound style offset
-            offsets = STYLE_OFFSETS.get(sound_style, STYLE_OFFSETS["balanced"])
-            eq_curve["low_shelf_gain"] = interpolated["low_shelf_gain"] + offsets["low_shelf_gain"]
-            eq_curve["first_band_gain"] = interpolated["first_band_gain"] + offsets["first_band_gain"]
-            eq_curve["second_band_gain"] = interpolated["second_band_gain"] + offsets["second_band_gain"]
-            eq_curve["third_band_gain"] = interpolated["third_band_gain"] + offsets["third_band_gain"]
-            eq_curve["high_shelf_gain"] = interpolated["high_shelf_gain"] + offsets["high_shelf_gain"]
-            
-            active_w = [f"{p} ({w*100:.0f}%)" for p, w in weights.items() if w > 0]
-            style_desc = sound_style.replace("_", " ").title()
-            mixing_reason = f"Synthesized manually blended curves: {', '.join(active_w)} (styled as '{style_desc}')."
-            
-            # Calculate smart dynamic Advanced Mastering Overlays based on tag weights!
-            punchy_w = weights.get("punchy", 0.0)
-            presence_w = weights.get("presence", 0.0)
-            airy_w = weights.get("airy", 0.0)
-            warm_w = weights.get("warm", 0.0)
-            bright_w = weights.get("bright", 0.0)
-            muddy_w = weights.get("muddy", 0.0)
-            
-            # Smart blending logic
-            bass_boost = round((punchy_w * 4.0) + (warm_w * 1.5) - (bright_w * 1.0), 1)
-            bass_boost = max(0.0, min(8.0, bass_boost))
-            
-            vocal_clarity = round((presence_w * 3.0) + (warm_w * 1.0), 1)
-            vocal_clarity = max(0.0, min(6.0, vocal_clarity))
-            
-            airiness = round((airy_w * 3.0) + (bright_w * 1.5) - (muddy_w * 1.5), 1)
-            airiness = max(0.0, min(6.0, airiness))
-            
-            # Dynamically compute safe preamp headroom to prevent digital clipping!
-            max_boost = max(bass_boost, vocal_clarity, airiness)
-            preamp_gain = round(-0.8 * max_boost, 2)
-            
-            dyn_mix = {
-                "preamp_gain": preamp_gain,
-                "strength": 1.0,
-                "bass_boost": bass_boost,
-                "vocal_clarity": vocal_clarity,
-                "airiness": airiness
-            }
-        
+            eq_curve = blend_curve(interpolated, sound_style)
+
+            mixing_reason = fallback_note + describe_mix(weights, sound_style)
+
+            dyn_mix = dynamic_overlays(weights)
+
     with state_lock:
         app_state["mode"] = "auto"  # Force auto mode so the UI updates and tracks changes correctly
         app_state["current_track"] = {
@@ -1464,78 +2042,297 @@ def search_and_mix():
             "genres": genres,
             "tags": tags,
             "weights": {} if recalled or current_engine == "llm" else weights,
+            # "search" is what keeps the monitor thread from replacing this with
+            # a Spotify status message on its next poll, 1.5 s from now.
+            "source": "search",
+            "placeholder": False,
+            "is_playing": False,
+            "is_private_session": False,
             "mixing_reason": mixing_reason
         }
-        app_state["eq"]["low_shelf_gain"] = eq_curve["low_shelf_gain"]
-        app_state["eq"]["first_band_gain"] = eq_curve["first_band_gain"]
-        app_state["eq"]["second_band_gain"] = eq_curve["second_band_gain"]
-        app_state["eq"]["third_band_gain"] = eq_curve["third_band_gain"]
-        app_state["eq"]["high_shelf_gain"] = eq_curve["high_shelf_gain"]
+        _set_eq_locked(eq_curve)
         app_state["mix"] = dyn_mix
-        
-    apply_and_write_apo()
-    return jsonify({"success": True, "state": app_state})
+        _refresh_pipeline_locked(auth_ok=app_state["spotify_authenticated"])
+
+    commit_state()
+    with state_lock:
+        return jsonify({"success": True, "state": app_state})
 
 
 # --- Server Init ---
 
+def _select_now_playing_source(config_yaml: str) -> None:
+    """Choose where "what is playing" comes from, and start it.
+
+    Order of preference, unless config.yaml pins one with
+    `now_playing.source: windows | spotify | none`:
+
+      1. **Windows media session.** Costs nothing, needs no account, and sees
+         every player on the machine rather than one streaming service. This is
+         the default because the app was meant to work without any API and,
+         until now, automatic detection was the one thing that did not.
+      2. **Spotify OAuth**, if credentials exist and Windows is unavailable.
+      3. Nothing, in which case the search box is the way in and everything
+         else still works.
+    """
+    global now_playing, smtc_source
+
+    preference = "auto"
+    try:
+        cfg = yaml.safe_load(Path(config_yaml).read_text(encoding="utf-8")) or {}
+        preference = str((cfg.get("now_playing") or {}).get("source", "auto")).lower()
+    except Exception:
+        pass
+    if preference not in ("auto", "windows", "spotify", "none"):
+        logger.warning(f"Unknown now_playing.source '{preference}'; using auto.")
+        preference = "auto"
+
+    if preference == "none":
+        logger.info("Now-playing detection disabled by config. Use the search box.")
+        _publish_source("none")
+        return
+
+    if preference in ("auto", "windows"):
+        if SmtcNowPlaying.is_available():
+            source = SmtcNowPlaying()
+            if source.start():
+                smtc_source = source
+                now_playing = source
+                logger.info("Now-playing source: Windows media session. "
+                            "No account needed; it sees every player on this PC.")
+                _publish_source("windows")
+                return
+            logger.warning(f"Windows media session did not start: {source.last_error}")
+        else:
+            logger.info(f"Windows media session unavailable "
+                        f"({SmtcNowPlaying.unavailable_reason()}).")
+        if preference == "windows":
+            _publish_source("none")
+            return
+
+    if spotify_oauth is not None:
+        now_playing = spotify_oauth
+        logger.info("Now-playing source: Spotify (connect your account to use it).")
+        _publish_source("spotify")
+        return
+
+    logger.info("No now-playing source available. The search box still works, "
+                "as does every EQ control.")
+    _publish_source("none")
+
+
+def _publish_source(name: str) -> None:
+    with state_lock:
+        app_state["now_playing_source"] = name
+
+
 def init_services():
-    global predictor, lastfm, spotify_client, spotify_oauth, apo_path, llm_client, main_config
-    
+    global predictor, lastfm, spotify_client, spotify_oauth, apo_path, llm_client
+    global main_config, preferences, now_playing, smtc_source
+
     config_yaml = "config.yaml"
     
     # Config and LLM Assistant Boot
     try:
         main_config = Config()
         llm_client = LLMClient(main_config)
-        logger.info(f"LLM Mixing Assistant successfully initialized (Provider: {main_config.llm_provider}).")
     except Exception as e:
         logger.error(f"Failed to boot LLM Client: {e}")
-        
+
+    with state_lock:
+        app_state["llm_available"] = llm_available()
+
+    if app_state["llm_available"]:
+        logger.info(f"Optional AI mixing engine available (provider: {main_config.llm_provider}).")
+    else:
+        logger.info("Optional AI mixing engine not configured. Keyword profile "
+                    "matching is the engine; it needs no API key and no network.")
+
     predictor = SemanticEQPredictor(db_path="data/test_library.db")
     lastfm = LastFMClient(config_path=config_yaml)
     
     try:
         spotify_client = SpotifyAPIClient(config_path=config_yaml)
+    except SpotifyNotConfigured as e:
+        # Expected on any install that has not opted in to Spotify.
+        logger.info(f"Spotify: {e}")
     except Exception as e:
         logger.warning(f"Spotify client credentials flow bypassed: {e}")
         
-    try:
-        spotify_oauth = SpotifyService()
-        logger.info("Successfully linked to main Spotify User OAuth Service.")
-    except Exception as e:
-        logger.error(f"Critical: Failed to boot Spotify OAuth Service: {e}")
-        
+    # Spotify OAuth is only worth starting if there are credentials for it to
+    # use. Reporting "successfully linked" on an install with no client_id was
+    # false, and it made a deliberate opt-out look like a working connection.
+    with state_lock:
+        app_state["spotify_configured"] = spotify_client is not None
+        app_state["spotify_redirect_uri"] = (
+            os.environ.get("SPOTIFY_REDIRECT_URI") or DEFAULT_REDIRECT_URI)
+        app_state["current_track"] = spotify_idle_track()
+
+    if spotify_client is not None:
+        try:
+            spotify_oauth = SpotifyService()
+            logger.info("Spotify OAuth service ready. Connect your account in the dashboard.")
+        except Exception as e:
+            logger.warning(f"Spotify OAuth service unavailable: {e}")
+
+    _select_now_playing_source(config_yaml)
+
     apo_path = load_apo_path_from_config(config_yaml)
+
+    try:
+        preferences = PreferenceStore("data/preferences.db")
+        logger.info("Preference store ready (%d votes recorded so far).",
+                    preferences.summary()["total"])
+    except Exception as e:
+        logger.error(f"Preference store unavailable: {e}")
+
+    # Refuse to run on a broken measuring instrument. Every headroom guarantee
+    # downstream is computed with it, so a silent failure here would mean
+    # silently clipping the user's audio.
+    report, ok = render.run_selftests()
+    if not ok:
+        logger.error("DSP renderer self-test FAILED. Refusing to start.\n" + report)
+        raise SystemExit(1)
+    logger.info("DSP renderer self-test: ALL PASS")
+
+    status = apo.probe_apo_status()
+    with state_lock:
+        app_state["apo_status"] = status
+        # The monitor loop only refreshes pipeline_status once Spotify is
+        # connected, and it short-circuits before that. Seed the output line
+        # here so a user who has not connected anything still sees the truth
+        # about whether the EQ can reach their speakers.
+        if status["state"] == "apo_not_installed":
+            app_state["pipeline_status"]["apo_writer"] = "Equalizer APO is not installed"
+        elif status["state"] == "apo_no_active_endpoint":
+            app_state["pipeline_status"]["apo_writer"] = "Not applied: APO is not enabled on your current output"
+        elif status["state"] == "apo_ready":
+            app_state["pipeline_status"]["apo_writer"] = "EQ active on your output"
+
+    if status["state"] == "apo_ready":
+        logger.info(f"Equalizer APO: {status['detail']}")
+    else:
+        logger.warning(f"Equalizer APO: {status['detail']}")
+
+
+_shutdown_done = threading.Event()
+
+
+def shutdown(reason: str = "exit"):
+    """Stop the monitor and hand the audio device back untouched.
+
+    Idempotent: it runs from atexit, from signal handlers, and from the Windows
+    console control handler, and any of them may fire together.
+    """
+    global active_monitoring
+    if _shutdown_done.is_set():
+        return
+    _shutdown_done.set()
+    active_monitoring = False
+    write_flat_config(reason)
+
+
+def _install_exit_handlers():
+    """Make flat-on-exit hold for every way this process can die.
+
+    The old code reset nothing, and its only cleanup hook was the `finally` of
+    app.run(), which does not run when the launcher's console window is closed.
+    A curve written for one song therefore stayed applied to every sound on the
+    machine until the app was next started.
+    """
+    atexit.register(lambda: shutdown("atexit"))
+
+    def _sig(signum, _frame):
+        shutdown(f"signal {signum}")
+        raise SystemExit(0)
+
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, _sig)
+            except (ValueError, OSError):
+                pass   # not on the main thread, or unsupported here
+
+    # Closing the console window sends CTRL_CLOSE_EVENT, which is not a POSIX
+    # signal and is not delivered to Python's signal handlers.
+    try:
+        import win32api
+        import win32con
+
+        def _console_handler(event):
+            if event in (win32con.CTRL_CLOSE_EVENT,
+                         win32con.CTRL_LOGOFF_EVENT,
+                         win32con.CTRL_SHUTDOWN_EVENT):
+                shutdown(f"console event {event}")
+                return True
+            return False
+
+        win32api.SetConsoleCtrlHandler(_console_handler, True)
+    except Exception as e:
+        logger.warning(
+            f"Console close handler unavailable ({e}). Closing the window "
+            "with the X button may leave the EQ applied."
+        )
 
 
 def main():
-    global active_monitoring
-    
+    port = int(os.environ.get("SONICVECTOR_PORT", "5001"))
+
+    # Refuse to become a second instance, before touching anything.
+    #
+    # Two copies share one Equalizer APO config file, so the loser of the race
+    # still does damage on its way down: init_services() and the startup
+    # commit_state() would write flat over the running instance's curve, then
+    # Flask would fail to bind, then the exit handler would write flat again.
+    # The listener's EQ silently went flat and the window that caused it had
+    # already closed. Checking the port first makes a double-launch a no-op.
+    if desktop.server_is_running(port=port):
+        logger.warning(
+            "Sonic Vector is already running on port %d. Leaving the running "
+            "instance alone; open http://127.0.0.1:%d to reach it.", port, port)
+        return
+
+    # Claim a Windows application identity before any window exists, so the
+    # taskbar groups this under Sonic Vector rather than under the interpreter.
+    desktop.set_app_user_model_id()
+
     init_services()
-    
+    _install_exit_handlers()
+
+    # Start from a known state rather than inheriting whatever was left behind.
+    # commit_state() rather than write_flat_config() because it also publishes
+    # output.response, so the scope draws a real (flat) trace immediately
+    # instead of staying blank until the first track change.
+    commit_state()
+
     monitor_thread = threading.Thread(target=monitor_spotify_playback)
     monitor_thread.daemon = True
     monitor_thread.start()
-    
-    def close_monitor():
-        global active_monitoring
-        active_monitoring = False
-        
-    def open_browser():
-        time.sleep(1.2)
-        import webbrowser
-        webbrowser.open("http://127.0.0.1:5001")
-        
-    browser_thread = threading.Thread(target=open_browser)
-    browser_thread.daemon = True
-    browser_thread.start()
-    
-    logger.info("Dynamic Semantic EQ GUI Dashboard Server running on: http://127.0.0.1:5001")
+
+    # Set SONICVECTOR_NO_BROWSER=1 to stop the app hijacking the default
+    # browser, which matters when it runs headless, under a tray host, or
+    # inside a preview pane.
+    if os.environ.get("SONICVECTOR_NO_BROWSER", "").strip() not in ("1", "true", "yes"):
+        def open_browser():
+            # Wait for the port rather than sleeping a fixed 1.2 s. On a cold
+            # start that guess opened the browser before Flask was listening,
+            # and an error page is read as "the app is broken".
+            for _ in range(80):
+                if desktop.server_is_running(port=port):
+                    break
+                time.sleep(0.25)
+            how = desktop.open_app_window(f"http://127.0.0.1:{port}")
+            logger.info(f"Dashboard opened as {how}.")
+
+        browser_thread = threading.Thread(target=open_browser)
+        browser_thread.daemon = True
+        browser_thread.start()
+    logger.info(f"Sonic Vector dashboard running on: http://127.0.0.1:{port}")
     try:
-        app.run(host="127.0.0.1", port=5001, debug=False)
+        app.run(host="127.0.0.1", port=port, debug=False)
     finally:
-        close_monitor()
+        shutdown("server stopped")
 
 
 if __name__ == '__main__':

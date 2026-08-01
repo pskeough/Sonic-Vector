@@ -19,32 +19,100 @@ from urllib.parse import urlencode, parse_qs, urlparse
 # This file is in src/spotify, so we go up three levels to the project root
 BASE_DIR = Path(__file__).parent.parent.parent
 
+# How long to hold the loopback listener open waiting for Spotify to call back.
+# Long enough for a password manager, a 2FA prompt and a slow "Agree" click;
+# short enough that an abandoned attempt frees the port on its own.
+AUTH_TIMEOUT_S = 300
+
+
+class _CallbackServer(HTTPServer):
+    """Loopback listener for the OAuth redirect.
+
+    allow_reuse_address matters here: without it, a login attempt that ended
+    badly leaves the port in TIME_WAIT and the next attempt fails to bind for
+    a couple of minutes, which reads to the user as "the button is broken".
+    """
+
+    allow_reuse_address = True
+
+
+def _describe_auth_error(error: Optional[str], redirect_uri: str) -> str:
+    """Turn Spotify's terse error code into something actionable."""
+    if error == "access_denied":
+        return "You declined the authorization request in Spotify."
+    if error in ("invalid_client", "invalid_request"):
+        return (f"Spotify rejected the request ({error}). The usual cause is a "
+                f"redirect URI mismatch: your Spotify app's settings must list "
+                f"exactly {redirect_uri}")
+    if error:
+        return f"Spotify returned '{error}'."
+    return ("The login window closed before Spotify sent a response. "
+            "Nothing was changed; you can try again.")
+
+
+_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Sonic Vector</title></head>
+<body style="font-family:Segoe UI,Arial,sans-serif;background:#1c1914;color:#ece8db;
+             padding:60px;text-align:center">
+  <h2 style="color:%(colour)s;margin-bottom:8px">%(heading)s</h2>
+  <p style="color:#b6b1a0;line-height:1.6">%(detail)s</p>
+  <script>setTimeout(function(){window.close();}, %(delay)d);</script>
+</body></html>"""
+
 
 class SpotifyCallbackHandler(BaseHTTPRequestHandler):
     """HTTP handler for Spotify OAuth callback"""
 
+    def _page(self, status, colour, heading, detail, delay=2500):
+        body = (_PAGE % {"colour": colour, "heading": heading,
+                         "detail": detail, "delay": delay}).encode("utf-8")
+        self.send_response(status)
+        self.send_header('Content-type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         """Handle GET request for OAuth callback"""
-        if '/callback' in self.path:
-            parsed_url = urlparse(self.path)
-            query_params = parse_qs(parsed_url.query)
+        parsed_url = urlparse(self.path)
 
-            if 'code' in query_params:
-                self.server.auth_code = query_params['code'][0]
-                self.send_response(200)
-                self.send_header('Content-type', 'text/html')
-                self.end_headers()
-                self.wfile.write(b'''
-                <html><body style="font-family: Arial; padding: 50px; text-align: center;">
-                <h2>Spotify Authentication Successful!</h2>
-                <p>You can close this window and return to your application.</p>
-                <script>setTimeout(function(){window.close();}, 2000);</script>
-                </body></html>
-                ''')
-            else:
-                self.send_error(400, 'Authorization failed')
-        else:
+        # Browsers ask for /favicon.ico on any page they render. Answering it
+        # as if it were the callback used to consume the single request this
+        # server was willing to handle, so the real callback was never read.
+        if parsed_url.path == '/favicon.ico':
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if '/callback' not in parsed_url.path:
             self.send_error(404)
+            return
+
+        query_params = parse_qs(parsed_url.query)
+
+        if 'code' in query_params:
+            self.server.auth_code = query_params['code'][0]
+            self.server.auth_error = None
+            self._page(200, "#a4c076", "Spotify connected",
+                       "You can close this window and go back to Sonic Vector.")
+            return
+
+        # Spotify reports refusals and misconfiguration here rather than at the
+        # authorize call, so this is the only place the real reason appears.
+        error = (query_params.get('error') or ['unknown_error'])[0]
+        self.server.auth_error = error
+        detail = {
+            'access_denied':
+                "You declined the authorization request. Nothing was changed.",
+            'invalid_client':
+                "Spotify rejected this app's Client ID.",
+        }.get(error, f"Spotify returned: {error}")
+        if error not in ('access_denied', 'invalid_client'):
+            detail += ("<br><br>If this mentions the redirect URI, make sure your "
+                       "Spotify app's settings list exactly the same address "
+                       "Sonic Vector is configured with.")
+        self._page(400, "#e06a50", "Spotify authorization failed", detail,
+                   delay=9000)
 
     def log_message(self, format, *args):
         """Suppress log messages"""
@@ -68,6 +136,10 @@ class SpotifyService:
         self.access_token = None
         self.refresh_token = None
         self.token_expires_at = None
+        # Why the last connect attempt failed, in words a listener can act on.
+        # Surfaced through /api/spotify/status; without it the Connect button
+        # simply re-enabled itself after eight seconds and explained nothing.
+        self.last_error = None
 
         self.auth_url = "https://accounts.spotify.com/authorize"
         self.token_url = "https://accounts.spotify.com/api/token"
@@ -161,21 +233,56 @@ class SpotifyService:
         }
 
         auth_url = f"{self.auth_url}?{urlencode(auth_params)}"
+
+        # Bind before opening the browser. If the port is unavailable the whole
+        # flow is doomed, and finding that out after the user has already
+        # logged in wastes their time and loses the code.
+        server_address = urlparse(self.redirect_uri)
+        try:
+            server = _CallbackServer(
+                (server_address.hostname or "127.0.0.1",
+                 server_address.port or 8888),
+                SpotifyCallbackHandler)
+        except OSError as e:
+            self.last_error = (
+                f"Could not listen on {self.redirect_uri} ({e}). Another program "
+                f"may be using that port, or a previous login attempt may still "
+                f"be waiting.")
+            self.logger.error(self.last_error)
+            return False
+
+        server.auth_code = None
+        server.auth_error = None
+        server.timeout = 1.0
+
         self.logger.info("Opening browser for Spotify authorization...")
-        print("Opening browser for Spotify authorization...")
         webbrowser.open(auth_url)
 
-        server_address = urlparse(self.redirect_uri)
-        server = HTTPServer((server_address.hostname, server_address.port), SpotifyCallbackHandler)
-        server.auth_code = None
-
         self.logger.info(f"Waiting for authorization callback at {self.redirect_uri}...")
-        print(f"Waiting for authorization callback at {self.redirect_uri}...")
-        server.handle_request()  # Handle one request and close
+        try:
+            # handle_request() on its own blocks forever. If the listener closed
+            # the tab, or never finished logging in, the old code left this
+            # thread parked on the port for the life of the process, so every
+            # later attempt to connect failed to bind and the button appeared
+            # dead. Poll with a deadline instead.
+            deadline = time.time() + AUTH_TIMEOUT_S
+            while time.time() < deadline:
+                server.handle_request()
+                if server.auth_code or server.auth_error:
+                    break
+            else:
+                self.last_error = (
+                    f"No response from Spotify within {AUTH_TIMEOUT_S // 60} minutes. "
+                    f"The login window may have been closed.")
+                self.logger.warning(self.last_error)
+                return False
+        finally:
+            server.server_close()
 
         if server.auth_code is None:
-            self.logger.error("Authentication failed or was cancelled by user")
-            print("Authentication failed or was cancelled.")
+            self.last_error = _describe_auth_error(
+                server.auth_error, self.redirect_uri)
+            self.logger.error(f"Authentication failed: {self.last_error}")
             return False
 
         self.logger.debug("Received authorization code, exchanging for tokens...")
@@ -200,14 +307,14 @@ class SpotifyService:
 
             self._save_tokens()
 
+            self.last_error = None
             self.logger.info(f"Spotify authentication successful! Token expires in {expires_in} seconds")
-            print("Spotify authentication successful!")
             return True
 
         except requests.exceptions.RequestException as e:
             error_text = e.response.text if hasattr(e, 'response') and e.response else str(e)
+            self.last_error = f"Spotify refused to issue a token: {error_text[:200]}"
             self.logger.error(f"Token exchange failed: {error_text}")
-            print(f"Token exchange failed: {error_text}")
             return False
 
     def _refresh_access_token(self, retry_count: int = 0, max_retries: int = 3) -> bool:
@@ -721,7 +828,7 @@ class SpotifyService:
         return False
 
     def cycle_repeat(self) -> bool:
-        """Cycle through repeat modes: off → context → track → off.
+        """Cycle through repeat modes: off -> context -> track -> off.
 
         Returns:
             True if cycle was successful, False otherwise
@@ -729,7 +836,7 @@ class SpotifyService:
         current = self.get_current_track()
         if current:
             current_state = current.get('repeat_state', 'off')
-            # Cycle: off → context → track → off
+            # Cycle: off -> context -> track -> off
             next_state = {'off': 'context', 'context': 'track', 'track': 'off'}.get(current_state, 'off')
             return self.set_repeat(next_state)
         return False

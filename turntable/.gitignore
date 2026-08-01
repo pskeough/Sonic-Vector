@@ -1,0 +1,15 @@
+# Vendored three.js is checked in on purpose — this view is offline-first and
+# must build with no network. node_modules is only the source it was copied
+# from and is not needed to run anything.
+node_modules/
+package-lock.json
+
+# Capture output from the prototype's frame-grab rig.
+shots/
+
+# Windows / editor noise
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.log

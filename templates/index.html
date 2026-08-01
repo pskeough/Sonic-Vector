@@ -3,329 +3,418 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EqualizerAI — Dynamic Semantic EQ Dashboard</title>
-    <link rel="icon" type="image/ico" href="/static/favicon.ico">
-    <!-- Modern Premium Typography -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <title>Sonic Vector — Semantic Mastering Console</title>
+    <link rel="icon" href="/static/favicon.ico" sizes="any">
+    <link rel="apple-touch-icon" href="/static/icon-192.png">
+    <!-- The manifest is what lets Edge or Chrome offer "Install this site as
+         an app", which produces a real Start Menu entry and a taskbar button
+         carrying this app's own icon rather than the browser's. -->
+    <link rel="manifest" href="/static/manifest.webmanifest">
+    <meta name="theme-color" content="#1c1914">
+    <meta name="application-name" content="Sonic Vector">
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <!-- Premium Glowing Backgrounds -->
-    <div class="glow-bg-1"></div>
-    <div class="glow-bg-2"></div>
 
-    <!-- Glowing Notification Banners -->
-    <div class="notification-container">
-        <!-- Equalizer APO Admin Privileges Alert -->
-        <div class="admin-warning-banner hidden" id="adminWarning">
-            <div class="banner-content">
-                <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-                <span><strong>Write Permission Error</strong>: Failed to update Equalizer APO config.txt. Please right-click <strong>launch_isolated_gui.bat</strong> and select <strong>"Run as Administrator"</strong>. Local backup updated in <code>data/config.txt</code>.</span>
-            </div>
-            <button class="banner-close-btn" onclick="this.parentElement.classList.add('hidden')">&times;</button>
-        </div>
+    <div class="desk">
+        <div class="chassis">
+            <div class="fascia">
+                <span class="screw screw-tl"></span>
+                <span class="screw screw-tr"></span>
+                <span class="screw screw-bl"></span>
+                <span class="screw screw-br"></span>
 
-        <!-- Spotify Online OAuth Connection Banner -->
-        <div class="spotify-connect-banner hidden" id="spotifyBanner">
-            <div class="banner-content">
-                <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2zm4.586 14.424c-.18.295-.563.387-.857.207-2.377-1.454-5.37-1.783-8.893-.982-.336.075-.668-.135-.745-.47-.077-.337.135-.668.47-.745 3.856-.88 7.15-.497 9.818 1.135.295.18.387.563.207.857zm1.225-2.72c-.226.367-.707.487-1.074.26-2.72-1.672-6.87-2.157-10.075-1.185-.413.125-.847-.107-.972-.52-.125-.413.107-.847.52-.972 3.666-1.112 8.232-.57 11.34 1.34.367.227.487.708.261 1.075zm.107-2.846C14.72 8.91 9.453 8.735 6.402 9.66c-.477.145-.98-.127-1.125-.604-.145-.477.127-.98.604-1.125 3.518-1.067 9.324-.863 13.018 1.33.43.255.57.81.315 1.24-.255.43-.81.57-1.24.315z"/></svg>
-                <span><strong>Spotify is not connected</strong>: Authorize your account to fetch genres, album art, and synchronize your streaming player dynamically!</span>
+                <!-- ══════════════ NAMEPLATE / MASTER HEADER ══════════════ -->
+                <header class="nameplate">
+                    <div class="brand">
+                        <span class="pwr-led" title="Power"></span>
+                        <div class="brand-text">
+                            <h1>Sonic <em>Vector</em></h1>
+                            <p class="brand-sub">ADAPTIVE EQ &nbsp;·&nbsp; REAL-TIME MASTERING CONSOLE</p>
+                        </div>
+                    </div>
+
+                    <div class="master-controls">
+                        <div class="ctl">
+                            <span class="ctl-caption">Engine</span>
+                            <!-- Keyword matching is the engine: no API key, no
+                                 network, no account. The AI option is revealed
+                                 only when an LLM provider is actually reachable
+                                 (see llm_available in the status payload). -->
+                            <select id="aiEngineSelect" aria-label="Prediction engine" class="sel">
+                                <option value="similarity">KEYWORD PROFILE MATCHING</option>
+                                <option value="llm" id="aiEngineOption" hidden disabled>AI MIXING ASSISTANT · GPU</option>
+                            </select>
+                        </div>
+
+                        <div class="ctl">
+                            <span class="ctl-caption">Voicing</span>
+                            <select id="soundStyleSelect" aria-label="Target voicing" class="sel">
+                                <option value="balanced">REFERENCE BALANCED</option>
+                                <option value="bass_boost">CLUB / BASS HEAD</option>
+                                <option value="warm">WARM / ANALOG</option>
+                                <option value="vocal">VOCAL / ACOUSTIC</option>
+                                <option value="chill">RELAXED / CHILL</option>
+                                <option value="loudness">LOUDNESS COMP</option>
+                            </select>
+                        </div>
+
+                        <div class="ctl">
+                            <span class="ctl-caption">EQ Sync</span>
+                            <div class="rocker-group">
+                                <span class="mode-label">MANUAL</span>
+                                <label class="rocker">
+                                    <input type="checkbox" id="syncModeToggle" aria-label="Auto-EQ sync (off means manual tuning)" checked>
+                                    <span class="rocker-knob"></span>
+                                </label>
+                                <span class="mode-label">AUTO</span>
+                            </div>
+                        </div>
+
+                        <div class="ctl">
+                            <span class="ctl-caption">&nbsp;</span>
+                            <div class="btn-row">
+                                <button id="disconnectSpotifyBtn" class="btn btn-danger hidden" title="Disconnect account and force fresh login">DISCONNECT</button>
+                                <!-- Opens the 3D turntable view. It is served by
+                                     its own small process on port 5177; the
+                                     handler checks that it is up first, so a
+                                     click never opens a dead window. -->
+                                <button id="turntableBtn" class="btn" title="Open the 3D turntable view">TURNTABLE ▸</button>
+                                <button id="resetEqBtn" class="btn" title="Zero all bands">RESET FLAT</button>
+                                <!-- Launched from the taskbar there is no console
+                                     to close, so this is the only clean way out.
+                                     It resets the system EQ to flat on the way. -->
+                                <button id="quitBtn" class="btn btn-danger" title="Stop Sonic Vector and reset the system EQ to flat">POWER OFF</button>
+                            </div>
+                        </div>
+
+                        <div class="serial">
+                            <span>MK·II</span>
+                            <span>SN&nbsp;0027</span>
+                        </div>
+                    </div>
+                </header>
+
+                <!-- ══════════════ NOTICE STRIPS ══════════════ -->
+                <div class="notification-container">
+                    <!-- Output-stage truth. While this is up, Equalizer APO is not
+                         attached to the output you are listening through, so nothing
+                         this console does is audible. Deliberately not dismissable.
+                         Text comes verbatim from apo_status.detail. -->
+                    <div class="apo-status-banner hidden" id="apoStatusBanner" role="alert" aria-live="assertive">
+                        <div class="banner-content">
+                            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none"><path d="M11 5L6 9H2v6h4l5 4V5z"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>
+                            <span><strong>Signal is not reaching your speakers</strong><br><span id="apoStatusDetail"></span></span>
+                        </div>
+                        <button class="btn btn-sm" id="apoRecheckBtn" type="button" title="Re-probe Equalizer APO">RE-CHECK</button>
+                    </div>
+
+                    <!-- config.txt write failures, keyed off apo_write_status.
+                         No elevation is involved: the Equalizer APO installer grants
+                         BUILTIN\Users FullControl on its config directory. -->
+                    <div class="admin-warning-banner hidden" id="adminWarning" role="alert">
+                        <div class="banner-content">
+                            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                            <span><strong id="adminWarningTitle"></strong><span id="adminWarningText"></span></span>
+                        </div>
+                        <button class="banner-close-btn" id="adminWarningClose" type="button" aria-label="Dismiss this message" title="Dismiss for this session">&times;</button>
+                    </div>
+
+                    <!-- Spotify is optional and the console is fully usable
+                         without it, so this strip never blocks anything. It has
+                         two states: no credentials (offer setup, dismissable)
+                         and credentials but no linked account (offer login). -->
+                    <div class="spotify-connect-banner hidden" id="spotifyBanner">
+                        <div class="banner-content">
+                            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2zm4.586 14.424c-.18.295-.563.387-.857.207-2.377-1.454-5.37-1.783-8.893-.982-.336.075-.668-.135-.745-.47-.077-.337.135-.668.47-.745 3.856-.88 7.15-.497 9.818 1.135.295.18.387.563.207.857zm1.225-2.72c-.226.367-.707.487-1.074.26-2.72-1.672-6.87-2.157-10.075-1.185-.413.125-.847-.107-.972-.52-.125-.413.107-.847.52-.972 3.666-1.112 8.232-.57 11.34 1.34.367.227.487.708.261 1.075zm.107-2.846C14.72 8.91 9.453 8.735 6.402 9.66c-.477.145-.98-.127-1.125-.604-.145-.477.127-.98.604-1.125 3.518-1.067 9.324-.863 13.018 1.33.43.255.57.81.315 1.24-.255.43-.81.57-1.24.315z"/></svg>
+                            <span id="spotifyBannerText"><strong>Spotify not connected</strong> — authorize your account to fetch genres, album art, and sync the streaming player.</span>
+                        </div>
+                        <div class="banner-actions">
+                            <button class="btn btn-sm" id="spotifySetupBtn" type="button" title="Enter your Spotify API keys">API KEYS</button>
+                            <button class="btn btn-spruce hidden" id="connectSpotifyBtn" type="button">CONNECT SPOTIFY</button>
+                            <button class="banner-close-btn hidden" id="spotifyBannerClose" type="button" aria-label="Hide this message" title="Hide for this session">&times;</button>
+                        </div>
+                    </div>
+
+                    <!-- Credential entry. Posting to /api/spotify/config verifies
+                         the pair against Spotify before writing config.yaml, and
+                         brings the integration up without a restart. -->
+                    <form class="spotify-setup-panel hidden" id="spotifySetupPanel" autocomplete="off">
+                        <div class="setup-head">
+                            <span class="setup-title">Spotify API Keys</span>
+                            <span class="setup-note">Entirely optional — the console works without it. Create an app at <code>developer.spotify.com/dashboard</code>, paste its keys here, and add the redirect URI below to that app's settings.</span>
+                        </div>
+                        <div class="setup-fields">
+                            <label class="setup-field">
+                                <span>Client ID</span>
+                                <input type="text" id="spotifyClientId" spellcheck="false" placeholder="32-character client id">
+                            </label>
+                            <label class="setup-field">
+                                <span>Client Secret</span>
+                                <input type="password" id="spotifyClientSecret" spellcheck="false" placeholder="32-character client secret">
+                            </label>
+                            <label class="setup-field">
+                                <span>Redirect URI</span>
+                                <input type="text" id="spotifyRedirectUri" spellcheck="false" value="http://127.0.0.1:8888/callback">
+                            </label>
+                        </div>
+                        <div class="setup-foot">
+                            <p class="setup-msg" id="spotifySetupMsg" role="status"></p>
+                            <div class="setup-buttons">
+                                <button type="button" class="btn btn-sm" id="spotifySetupCancel">CLOSE</button>
+                                <button type="submit" class="btn btn-sm btn-spruce" id="spotifySetupSave">VERIFY &amp; SAVE</button>
+                            </div>
+                        </div>
+                    </form>
+                </div>
+
+                <!-- ══════════════ CONSOLE DECK ══════════════ -->
+                <main class="deck">
+
+                    <!-- LEFT BAY — scope, channel faders, master trim -->
+                    <section class="bay bay-left">
+
+                        <!-- Frequency response scope. The trace is the filter the
+                             backend actually wrote to Equalizer APO, preamp folded
+                             in, not a curve approximated in the browser. -->
+                        <div class="module scope-module">
+                            <div class="mod-head">
+                                <span class="mod-title">Frequency Response</span>
+                                <div class="meter-cluster">
+                                    <span class="meter-chip bypass hidden" id="bypassChip">BYPASS</span>
+                                    <span class="meter-chip" id="preampReadout">PREAMP 0.00 dB</span>
+                                    <span class="meter-chip warn hidden" id="limitReadout"></span>
+                                </div>
+                            </div>
+                            <div class="canvas-container" id="canvasContainer">
+                                <canvas id="eqCanvas" role="img" aria-label="Frequency response of the filter chain currently written to Equalizer APO"></canvas>
+                            </div>
+                            <div class="scope-foot">
+                                <button class="btn btn-sm compare-btn" id="compareBtn" type="button" aria-pressed="false" title="Hold to hear the unprocessed signal (or hold the Space bar)">A / B · HOLD</button>
+                                <span class="foot-note">level-matched (assumed spectrum) &nbsp;·&nbsp; or hold <kbd>Space</kbd></span>
+                                <span class="foot-meta">20 Hz — 20 kHz</span>
+                            </div>
+                        </div>
+
+                        <!-- 5-band channel strips -->
+                        <div class="module channels-module">
+                            <div class="mod-head">
+                                <span class="mod-title">Parametric Equalizer</span>
+                                <span class="manual-mode-indicator" id="consoleModeTag">Auto-Sync Active</span>
+                            </div>
+
+                            <!-- Shown when /api/update_eq rejects a value (HTTP 400). -->
+                            <p class="eq-error hidden" id="eqError" role="alert"></p>
+
+                            <div class="strips">
+                                <div class="strip">
+                                    <span class="readout" id="val_low_shelf">+0.0 dB</span>
+                                    <div class="slider-track-wrap">
+                                        <div class="slot"></div>
+                                        <div class="slider-glow-bar" id="glow_low_shelf"></div>
+                                        <input type="range" orient="vertical" id="slider_low_shelf" aria-label="Low shelf gain at 120 hertz, in decibels" class="vertical-slider" min="-15" max="15" step="0.1" value="0">
+                                    </div>
+                                    <span class="strip-freq">120 Hz</span>
+                                    <span class="strip-name">Low Shelf</span>
+                                </div>
+
+                                <div class="strip">
+                                    <span class="readout" id="val_mid_1">+0.0 dB</span>
+                                    <div class="slider-track-wrap">
+                                        <div class="slot"></div>
+                                        <div class="slider-glow-bar" id="glow_mid_1"></div>
+                                        <input type="range" orient="vertical" id="slider_mid_1" aria-label="Peak band 1 gain at 250 hertz, in decibels" class="vertical-slider" min="-15" max="15" step="0.1" value="0">
+                                    </div>
+                                    <span class="strip-freq">250 Hz</span>
+                                    <span class="strip-name">Peak 1 · Lo-Mid</span>
+                                </div>
+
+                                <div class="strip">
+                                    <span class="readout" id="val_mid_2">+0.0 dB</span>
+                                    <div class="slider-track-wrap">
+                                        <div class="slot"></div>
+                                        <div class="slider-glow-bar" id="glow_mid_2"></div>
+                                        <input type="range" orient="vertical" id="slider_mid_2" aria-label="Peak band 2 gain at 1 kilohertz, in decibels" class="vertical-slider" min="-15" max="15" step="0.1" value="0">
+                                    </div>
+                                    <span class="strip-freq">1 kHz</span>
+                                    <span class="strip-name">Peak 2 · Mid</span>
+                                </div>
+
+                                <div class="strip">
+                                    <span class="readout" id="val_mid_3">+0.0 dB</span>
+                                    <div class="slider-track-wrap">
+                                        <div class="slot"></div>
+                                        <div class="slider-glow-bar" id="glow_mid_3"></div>
+                                        <input type="range" orient="vertical" id="slider_mid_3" aria-label="Peak band 3 gain at 3.5 kilohertz, in decibels" class="vertical-slider" min="-15" max="15" step="0.1" value="0">
+                                    </div>
+                                    <span class="strip-freq">3.5 kHz</span>
+                                    <span class="strip-name">Peak 3 · Hi-Mid</span>
+                                </div>
+
+                                <div class="strip">
+                                    <span class="readout" id="val_high_shelf">+0.0 dB</span>
+                                    <div class="slider-track-wrap">
+                                        <div class="slot"></div>
+                                        <div class="slider-glow-bar" id="glow_high_shelf"></div>
+                                        <input type="range" orient="vertical" id="slider_high_shelf" aria-label="High shelf gain at 10 kilohertz, in decibels" class="vertical-slider" min="-15" max="15" step="0.1" value="0">
+                                    </div>
+                                    <span class="strip-freq">10 kHz</span>
+                                    <span class="strip-name">High Shelf</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Master trim overlays -->
+                        <div class="module trim-module">
+                            <div class="mod-head">
+                                <span class="mod-title">Mastering Overlays</span>
+                                <span class="mod-meta">MASTER SECTION</span>
+                            </div>
+
+                            <div class="trim-rows">
+                                <div class="mix-row">
+                                    <span class="mix-label">System Preamp</span>
+                                    <div class="mix-track">
+                                        <input type="range" id="slider_mix_preamp" aria-label="System preamp trim, in decibels" min="-12" max="0" step="0.1" value="0" class="horizontal-slider">
+                                    </div>
+                                    <span class="readout sm" id="val_mix_preamp">0.00 dB</span>
+                                </div>
+
+                                <div class="mix-row">
+                                    <span class="mix-label">EQ Strength</span>
+                                    <div class="mix-track">
+                                        <input type="range" id="slider_mix_strength" aria-label="EQ strength scale, as a multiplier" min="0" max="2" step="0.05" value="1" class="horizontal-slider">
+                                    </div>
+                                    <span class="readout sm" id="val_mix_strength">1.0x</span>
+                                </div>
+
+                                <div class="mix-row">
+                                    <span class="mix-label">Bass Punch</span>
+                                    <div class="mix-track">
+                                        <input type="range" id="slider_mix_bass" aria-label="Bass punch overlay, in decibels" min="0" max="8" step="0.2" value="0" class="horizontal-slider">
+                                    </div>
+                                    <span class="readout sm" id="val_mix_bass">0.0 dB</span>
+                                </div>
+
+                                <div class="mix-row">
+                                    <span class="mix-label">Vocal Presence</span>
+                                    <div class="mix-track">
+                                        <input type="range" id="slider_mix_vocal" aria-label="Vocal presence boost, in decibels" min="0" max="6" step="0.2" value="0" class="horizontal-slider">
+                                    </div>
+                                    <span class="readout sm" id="val_mix_vocal">0.0 dB</span>
+                                </div>
+
+                                <div class="mix-row">
+                                    <span class="mix-label">Harmonic Air</span>
+                                    <div class="mix-track">
+                                        <input type="range" id="slider_mix_air" aria-label="Harmonic air, in decibels" min="0" max="6" step="0.2" value="0" class="horizontal-slider">
+                                    </div>
+                                    <span class="readout sm" id="val_mix_air">0.0 dB</span>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- RIGHT BAY — platter, signal path, tags, vectors -->
+                    <section class="bay bay-right">
+
+                        <!-- Now playing / turntable -->
+                        <div class="module nowplaying-module">
+                            <div class="mod-head">
+                                <span class="mod-title"><span class="live-dot"></span>Now Playing</span>
+                                <span class="mod-meta" id="trackSourceTag">SRC · SEARCH</span>
+                            </div>
+
+                            <div class="track-details-container">
+                                <div class="platter-well">
+                                    <div class="disc-vinyl" id="vinylSpindle">
+                                        <img src="" id="trackArt" class="album-cover" alt="Album Cover" onerror="this.src='/static/placeholder_cover.png'">
+                                        <div class="disc-center"></div>
+                                    </div>
+                                </div>
+
+                                <div class="track-text">
+                                    <h3 id="trackTitle">No Track Loaded</h3>
+                                    <p id="trackArtist" class="artist-sub">Search a track below to build a mix.</p>
+                                    <p id="trackAlbum" class="album-sub"></p>
+                                    <button id="redoMixBtn" class="btn btn-block" title="Re-evaluate tags and remix with random analog variance">REDO MIX · REMIX</button>
+                                </div>
+                            </div>
+
+                            <form id="searchOverrideForm" class="search-strip" autocomplete="off">
+                                <input type="text" id="searchQuery" aria-label="Search a track by name to analyze" placeholder="Artist - Track, or just a track name…">
+                                <button type="submit" class="btn btn-sm">ANALYZE</button>
+                            </form>
+                        </div>
+
+                        <!-- Listener rating. Capture only for now: there is no model
+                             consuming these yet, but votes are worthless
+                             retroactively, so collection starts with the button. -->
+                        <div class="module rating-module">
+                            <div class="mod-head">
+                                <span class="mod-title">Rate This Mix</span>
+                                <span class="mod-meta" id="voteCount">0 VOTES</span>
+                            </div>
+                            <div class="rating-body">
+                                <div class="vote-row">
+                                    <button class="btn vote-btn vote-up" id="voteUpBtn" type="button" title="This mix sounds good on this track">
+                                        <svg viewBox="0 0 24 24" width="15" height="15" stroke="currentColor" stroke-width="2" fill="none"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/></svg>
+                                        <span>GOOD MIX</span>
+                                    </button>
+                                    <button class="btn vote-btn vote-down" id="voteDownBtn" type="button" title="This mix sounds wrong on this track">
+                                        <svg viewBox="0 0 24 24" width="15" height="15" stroke="currentColor" stroke-width="2" fill="none"><path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3zm7-13h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17"/></svg>
+                                        <span>NOT THIS</span>
+                                    </button>
+                                </div>
+                                <p class="vote-note" id="voteNote">Votes are logged against the exact curve you are hearing.</p>
+                            </div>
+                        </div>
+
+                        <!-- Mastering insights + signal path -->
+                        <div class="module insights-module" id="insightsCard">
+                            <div class="mod-head">
+                                <span class="mod-title">Signal Path</span>
+                                <span class="mod-meta">STATUS</span>
+                            </div>
+                            <div class="insights-body">
+                                <p id="mixingReason" class="engineer-note">Equalizer flat. Stream music to load an active mixing profile.</p>
+                                <ul class="pipeline-status-list" id="pipelineStatusList"></ul>
+                            </div>
+                        </div>
+
+                        <!-- Harvested tags -->
+                        <div class="module tags-module">
+                            <div class="mod-head">
+                                <span class="mod-title">Sonic Descriptors</span>
+                                <span class="mod-meta">HARVESTED</span>
+                            </div>
+                            <div class="tags-list" id="tagsList">
+                                <span class="no-tags-msg">No tags loaded yet.</span>
+                            </div>
+                        </div>
+
+                        <!-- Semantic vector weights -->
+                        <div class="module weights-module" id="weightsCard">
+                            <div class="mod-head">
+                                <span class="mod-title">Profile Matches</span>
+                                <span class="mod-meta">KEYWORD MATCH</span>
+                            </div>
+                            <div class="weights-list" id="weightsList">
+                                <div class="no-weights-msg">No profile keywords matched yet.</div>
+                            </div>
+                        </div>
+                    </section>
+                </main>
+
+                <!-- ══════════════ BOTTOM RAIL ══════════════ -->
+                <footer class="rail">
+                    <span>SONIC VECTOR &nbsp;·&nbsp; SEMANTIC MASTERING CONSOLE</span>
+                    <span class="rail-right">HAND-WIRED IN CLAUDE TONES &nbsp;·&nbsp; MK·II</span>
+                </footer>
             </div>
-            <button class="premium-btn btn-spotify" id="connectSpotifyBtn">Connect Spotify Account</button>
         </div>
     </div>
 
-    <div class="dashboard-wrapper">
-        <!-- Main Top Header -->
-        <header class="app-header">
-            <div class="logo-area">
-                <div class="logo-glow-ring">
-                    <span class="pulse-core"></span>
-                </div>
-                <div class="logo-titles">
-                    <h1>Equalizer<span>AI</span></h1>
-                    <p class="subtitle">Semantic Text Similarity EQ & Real-Time Mastering Suite</p>
-                </div>
-            </div>
-            
-            <div class="controls-header">
-                <!-- AI Engine Selector -->
-                <div class="engine-select-container">
-                    <select id="aiEngineSelect" class="premium-select">
-                        <option value="llm">🤖 AI Mixing Assistant (GPU)</option>
-                        <option value="similarity">📊 Vector Similarity Centroids</option>
-                    </select>
-                </div>
-
-                <!-- Target Sound Style Selector -->
-                <div class="style-select-container" style="margin-right: 12px;">
-                    <select id="soundStyleSelect" class="premium-select">
-                        <option value="balanced">🎧 Reference Balanced</option>
-                        <option value="bass_boost">🔊 Club / Bass Head</option>
-                        <option value="warm">🎷 Warm / Analog Cozy</option>
-                        <option value="vocal">🎙️ Vocal / Acoustic Focus</option>
-                        <option value="chill">🍃 Relaxed / Chill Vibe</option>
-                        <option value="loudness">⚡ Loudness Compensation</option>
-                    </select>
-                </div>
-
-                <!-- Sync Toggle Switch -->
-                <div class="mode-switch-container">
-                    <span class="mode-label manual-lbl">Manual Tuning</span>
-                    <label class="glow-switch">
-                        <input type="checkbox" id="syncModeToggle" checked>
-                        <span class="switch-slider"></span>
-                    </label>
-                    <span class="mode-label auto-lbl">Auto-EQ Sync</span>
-                </div>
-                
-                <!-- Disconnect Spotify Button -->
-                <button id="disconnectSpotifyBtn" class="premium-btn btn-secondary" style="border-color: rgba(239, 68, 68, 0.2); color: #fca5a5;" title="Disconnect account and force fresh login">
-                    <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none"><path d="M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10"/></svg>
-                    <span>Disconnect Spotify</span>
-                </button>
-
-                <!-- Reset Button -->
-                <button id="resetEqBtn" class="premium-btn btn-secondary">
-                    <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
-                    <span>Reset Flat</span>
-                </button>
-            </div>
-        </header>
-
-        <!-- Main Dashboard Content Grid -->
-        <main class="dashboard-grid">
-            <!-- LEFT PANEL: Mastering Curve Visualizer & Sliders Console -->
-            <section class="panel-left">
-                <!-- Logarithmic EQ Frequency Response Visualizer -->
-                <div class="glass-card visualizer-card">
-                    <div class="card-header">
-                        <h2>
-                            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none"><path d="M12 2v20M17 5v14M22 9v6M7 8v8M2 10v4"/></svg>
-                            <span>Live Frequency Response Curve</span>
-                        </h2>
-                        <div class="db-scale-legend">
-                            <span class="legend-badge boost">+15 dB</span>
-                            <span class="legend-badge flat">0 dB</span>
-                            <span class="legend-badge cut">-15 dB</span>
-                        </div>
-                    </div>
-                    <div class="canvas-container">
-                        <canvas id="eqCanvas"></canvas>
-                    </div>
-                </div>
-
-                <!-- 5-Band Slider Console Card -->
-                <div class="glass-card sliders-card">
-                    <div class="card-header">
-                        <h2>
-                            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg>
-                            <span>Parametric Equalizer Console</span>
-                        </h2>
-                        <span class="manual-mode-indicator" id="consoleModeTag">Auto-Sync Active</span>
-                    </div>
-                    
-                    <div class="sliders-wrapper">
-                        <!-- Band 1: Low Shelf -->
-                        <div class="slider-group vertical">
-                            <div class="slider-track-wrap">
-                                <input type="range" id="slider_low_shelf" class="vertical-slider" min="-15" max="15" step="0.1" value="0">
-                                <div class="slider-glow-bar" id="glow_low_shelf"></div>
-                            </div>
-                            <span class="slider-gain-val" id="val_low_shelf">+0.0 dB</span>
-                            <span class="slider-freq">120 Hz</span>
-                            <span class="slider-title">Low Shelf</span>
-                        </div>
-
-                        <!-- Band 2: Mid Band 1 -->
-                        <div class="slider-group vertical">
-                            <div class="slider-track-wrap">
-                                <input type="range" id="slider_mid_1" class="vertical-slider" min="-15" max="15" step="0.1" value="0">
-                                <div class="slider-glow-bar" id="glow_mid_1"></div>
-                            </div>
-                            <span class="slider-gain-val" id="val_mid_1">+0.0 dB</span>
-                            <span class="slider-freq">250 Hz</span>
-                            <span class="slider-title">PK 1 (Low-Mid)</span>
-                        </div>
-
-                        <!-- Band 3: Mid Band 2 -->
-                        <div class="slider-group vertical">
-                            <div class="slider-track-wrap">
-                                <input type="range" id="slider_mid_2" class="vertical-slider" min="-15" max="15" step="0.1" value="0">
-                                <div class="slider-glow-bar" id="glow_mid_2"></div>
-                            </div>
-                            <span class="slider-gain-val" id="val_mid_2">+0.0 dB</span>
-                            <span class="slider-freq">1000 Hz</span>
-                            <span class="slider-title">PK 2 (Mids)</span>
-                        </div>
-
-                        <!-- Band 4: Mid Band 3 -->
-                        <div class="slider-group vertical">
-                            <div class="slider-track-wrap">
-                                <input type="range" id="slider_mid_3" class="vertical-slider" min="-15" max="15" step="0.1" value="0">
-                                <div class="slider-glow-bar" id="glow_mid_3"></div>
-                            </div>
-                            <span class="slider-gain-val" id="val_mid_3">+0.0 dB</span>
-                            <span class="slider-freq">3500 Hz</span>
-                            <span class="slider-title">PK 3 (High-Mid)</span>
-                        </div>
-
-                        <!-- Band 5: High Shelf -->
-                        <div class="slider-group vertical">
-                            <div class="slider-track-wrap">
-                                <input type="range" id="slider_high_shelf" class="vertical-slider" min="-15" max="15" step="0.1" value="0">
-                                <div class="slider-glow-bar" id="glow_high_shelf"></div>
-                            </div>
-                            <span class="slider-gain-val" id="val_high_shelf">+0.0 dB</span>
-                            <span class="slider-freq">10000 Hz</span>
-                            <span class="slider-title">High Shelf</span>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Custom Mix Overlays Panel -->
-                <div class="glass-card mix-overlays-card">
-                    <div class="card-header">
-                        <h2>
-                            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none"><path d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10z"/><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
-                            <span>Advanced Mastering Overlays</span>
-                        </h2>
-                    </div>
-
-                    <div class="mix-sliders-container">
-                        <!-- Mix Item 1: Preamp volume -->
-                        <div class="mix-row">
-                            <div class="mix-info">
-                                <span class="mix-label">System Preamp</span>
-                                <span class="mix-val" id="val_mix_preamp">0.00 dB</span>
-                            </div>
-                            <input type="range" id="slider_mix_preamp" min="-12" max="12" step="0.1" value="0" class="horizontal-slider">
-                        </div>
-
-                        <!-- Mix Item 2: EQ Intensity Strength -->
-                        <div class="mix-row">
-                            <div class="mix-info">
-                                <span class="mix-label">EQ Strength Scale</span>
-                                <span class="mix-val" id="val_mix_strength">1.0x</span>
-                            </div>
-                            <input type="range" id="slider_mix_strength" min="0" max="2" step="0.05" value="1" class="horizontal-slider">
-                        </div>
-
-                        <!-- Mix Item 3: Bass Focus -->
-                        <div class="mix-row">
-                            <div class="mix-info">
-                                <span class="mix-label">Bass Punch Overlay</span>
-                                <span class="mix-val" id="val_mix_bass">0.0 dB</span>
-                            </div>
-                            <input type="range" id="slider_mix_bass" min="0" max="10" step="0.2" value="0" class="horizontal-slider">
-                        </div>
-
-                        <!-- Mix Item 4: Vocal Focus -->
-                        <div class="mix-row">
-                            <div class="mix-info">
-                                <span class="mix-label">Vocal Presence Boost</span>
-                                <span class="mix-val" id="val_mix_vocal">0.0 dB</span>
-                            </div>
-                            <input type="range" id="slider_mix_vocal" min="0" max="8" step="0.2" value="0" class="horizontal-slider">
-                        </div>
-
-                        <!-- Mix Item 5: Airiness Boost -->
-                        <div class="mix-row">
-                            <div class="mix-info">
-                                <span class="mix-label">Upper Harmonical Air</span>
-                                <span class="mix-val" id="val_mix_air">0.0 dB</span>
-                            </div>
-                            <input type="range" id="slider_mix_air" min="0" max="8" step="0.2" value="0" class="horizontal-slider">
-                        </div>
-                    </div>
-                </div>
-            </section>
-
-            <!-- RIGHT PANEL: Metadata & Tag Semantic Weights -->
-            <section class="panel-right">
-                <!-- Active Track Card -->
-                <div class="glass-card active-song-card">
-                    <div class="card-header">
-                        <h2>
-                            <span class="live-indicator-dot"></span>
-                            <span>Currently Playing</span>
-                        </h2>
-                    </div>
-
-                    <div class="track-details-container">
-                        <!-- Disc / Album Artwork wrapper -->
-                        <div class="album-art-wrapper">
-                            <div class="disc-vinyl" id="vinylSpindle">
-                                <img src="" id="trackArt" class="album-cover" alt="Album Cover" onerror="this.src='/static/placeholder_cover.png'">
-                                <div class="disc-center"></div>
-                            </div>
-                        </div>
-
-                        <div class="track-text">
-                            <h3 id="trackTitle">No Track Playing</h3>
-                            <p id="trackArtist" class="artist-sub">Please stream Spotify or run search</p>
-                            <p id="trackAlbum" class="album-sub"></p>
-                            <button id="redoMixBtn" class="premium-btn btn-secondary" style="margin-top: 12px; padding: 6px 12px; font-size: 11px; border-color: rgba(0, 242, 254, 0.2); width: 100%; display: flex; align-items: center; justify-content: center; gap: 6px;" title="Re-evaluate tags and remix with random analog variance">
-                                <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2.5" fill="none" style="vertical-align: middle;"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
-                                <span>Redo Mix (Remix)</span>
-                            </button>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- AI Mastering Insights Card (Hidden for clean parallel alignment) -->
-                <div class="glass-card insights-card" id="insightsCard" style="display: none;">
-                    <div class="card-header">
-                        <h2>
-                            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
-                            <span>Mastering Insights</span>
-                        </h2>
-                    </div>
-                    <div class="insights-body">
-                        <p id="mixingReason" style="font-size: 13px; line-height: 1.6; color: #cbd5e1;">Equalizer flat. Stream music to load active mixing profile.</p>
-                        
-                        <!-- Dynamic Pipeline Status Monitor List -->
-                        <div class="pipeline-monitor-container" style="margin-top: 16px; border-top: 1px solid rgba(255, 255, 255, 0.08); padding-top: 14px;">
-                            <h3 style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: rgba(255, 255, 255, 0.4); margin-bottom: 8px;">System Status & Pipeline</h3>
-                            <ul class="pipeline-status-list" id="pipelineStatusList" style="list-style: none; padding: 0; margin: 0; font-size: 12px; display: flex; flex-direction: column; gap: 8px;">
-                                <!-- Populated dynamically by app.js -->
-                            </ul>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Combined Tags list -->
-                <div class="glass-card tags-card">
-                    <div class="card-header">
-                        <h2>
-                            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
-                            <span>Harvested Sonic Descriptors</span>
-                        </h2>
-                    </div>
-                    <div class="tags-list" id="tagsList">
-                        <span class="no-tags-msg">No tags loaded yet.</span>
-                    </div>
-                </div>
-
-                <!-- Vector Semantic Match Weights -->
-                <div class="glass-card weights-card" id="weightsCard">
-                    <div class="card-header">
-                        <h2>
-                            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></svg>
-                            <span>Semantic Profile Vectors</span>
-                        </h2>
-                    </div>
-                    <div class="weights-list" id="weightsList">
-                        <div class="no-weights-msg">0% Active similarities.</div>
-                    </div>
-                </div>
-            </section>
-        </main>
-    </div>
-
-    <!-- Loaded App Javascript Logic -->
     <script src="/static/app.js"></script>
 </body>
 </html>
